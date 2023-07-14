@@ -34,6 +34,7 @@ mod log;
 use core::borrow::Borrow;
 use core::fmt;
 use core::hash::Hash;
+use bytes::Bytes;
 
 // Available only with std.
 #[cfg(feature = "std")]
@@ -47,8 +48,32 @@ pub trait HyperLogLog<H: Hash + ?Sized> {
         H: Borrow<Q>,
         Q: Hash + ?Sized;
 
+    /// Deletes a value from the multiset.
+    fn delete<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError>
+    where
+        H: Borrow<Q>,
+        Q: Hash + ?Sized;
+
     /// Estimates the cardinality of the multiset.
     fn count(&mut self) -> Result<f64, HyperLogLogError>;
+
+    /// Merges the multiset with another multiset.
+    fn merge(&mut self, other: &Self) -> Result<(), HyperLogLogError>;
+
+    /// Merges another HyperLogLogPlus into this one without using any counter data.
+    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) ->  Result<(), HyperLogLogError>;
+
+    /// Serializes the HyperLogLogPlus into a byte array.
+    fn serialize(&mut self) -> Result<Bytes, HyperLogLogError>;
+
+    /// Deserializes a byte array into a HyperLogLogPlus.
+    fn deserialize(bytes: &[u8]) -> Result<Self, HyperLogLogError> where Self: Sized;
+
+    /// Deserializes a byte array into a HyperLogLogPlus without loading any counter data.
+    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError> where Self: Sized;
+
+    /// Returns the estimate of the memory used by the multiset.
+    fn mem_size(&mut self) -> usize;
 }
 
 #[derive(Debug, PartialEq)]

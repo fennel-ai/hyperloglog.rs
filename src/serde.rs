@@ -37,6 +37,7 @@ impl<H> HyperLogLogPlus<H>
     pub fn to_bytes(&mut self) -> Result<Bytes, HyperLogLogError> {
         if self.is_sparse() {
             self.merge_sparse()?;
+            self.merge_del_sparse()?;
         }
         let serializable = HyperLogLogPlusSerializable {
             precision: self.precision,

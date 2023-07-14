@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
 use std::marker::PhantomData;
+use bytes::Bytes;
 
 use crate::common::*;
 use crate::constants;
@@ -78,6 +79,65 @@ where
     phantom: PhantomData<H>,
 }
 
+impl<H> HyperLogLogCommon for HyperLogLogPlus<H> where H: Hash + ?Sized {}
+
+impl<H> HyperLogLog<H> for HyperLogLogPlus<H>
+    where
+        H: Hash + ?Sized,
+{
+    /// Inserts a new value to the multiset.
+    fn insert<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError>
+        where
+            H: Borrow<Q>,
+            Q: Hash + ?Sized,
+    {
+        self.insert_impl(value)
+    }
+
+    /// Deletes a value from the multiset.
+    fn delete<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError> where H: Borrow<Q>, Q: Hash + ?Sized {
+        self.delete_impl(value)
+    }
+
+    /// Estimates the cardinality of the multiset.
+    fn count(&mut self) -> Result<f64, HyperLogLogError> {
+        self.count_impl()
+    }
+
+    /// Merges another HyperLogLogPlus into this one.
+    fn merge(&mut self, other: &HyperLogLogPlus<H>) ->  Result<(), HyperLogLogError> {
+        self.merge_impl(other)
+    }
+
+    /// Merges another HyperLogLogPlus into this one without using any counter data.
+    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) ->  Result<(), HyperLogLogError> {
+        self.compact_merge_impl(other)
+    }
+
+    /// Serializes the HyperLogLogPlus into a byte array.
+    fn serialize(&mut self) -> Result<Bytes, HyperLogLogError> {
+        self.to_bytes()
+    }
+
+    /// Deserializes a byte array into a HyperLogLogPlus.
+    fn deserialize(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    where Self: Sized
+    {
+        HyperLogLogPlus::from_bytes(bytes)
+    }
+
+    /// Deserializes a byte array into a HyperLogLogPlus without loading any counter data.
+    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError> where Self: Sized {
+        HyperLogLogPlus::from_bytes_compact(bytes)
+    }
+
+
+    /// Returns the estimate of the memory used by the multiset.
+    fn mem_size(&mut self) -> usize {
+        self.mem_size_impl()
+    }
+}
+
 impl<H> HyperLogLogPlus<H>
 where
     H: Hash + ?Sized,
@@ -122,7 +182,7 @@ where
     }
 
     /// Size of the HyperLogLogPlus instance in bytes.
-    pub fn mem_size(&mut self) -> usize {
+    fn mem_size_impl(&mut self) -> usize {
         self.merge_sparse().unwrap();
         let self_size = std::mem::size_of_val(self);
         let insert_tmpset_size = self.insert_tmpset.len() * (std::mem::size_of::<u32>() * 2);
@@ -150,12 +210,66 @@ where
             + register_counters_size
     }
 
+    fn count_impl(&mut self) -> Result<f64, HyperLogLogError> {
+        // Merge tmpset into sparse representation.
+        if self.registers.is_none() {
+            self.merge_sparse()?;
+            self.merge_del_sparse()?;
+        }
+
+        match self.registers.as_mut() {
+            Some(registers) => {
+                // We use normal representation.
+
+                let zeros = registers.zeros();
+
+                if zeros != 0 {
+                    let correction = Self::linear_count(self.counts.0, zeros);
+
+                    // Use linear counting only if value below threshold.
+                    if correction <= Self::threshold(self.precision) {
+                        Ok(correction)
+                    } else {
+                        // Calculate the raw estimate.
+                        let mut raw = Self::estimate_raw_plus(registers.iter(), self.counts.0);
+
+                        // Apply correction if required.
+                        if raw <= 5.0 * self.counts.0 as f64 {
+                            raw -= self.estimate_bias(raw);
+                        }
+
+                        Ok(raw)
+                    }
+                } else {
+                    // Calculate the raw estimate.
+                    let mut raw = Self::estimate_raw_plus(registers.iter(), self.counts.0);
+
+                    // Apply correction if required.
+                    if raw <= 5.0 * self.counts.0 as f64 {
+                        raw -= self.estimate_bias(raw);
+                    }
+
+                    Ok(raw)
+                }
+            }
+            None => {
+                // We use sparse representation.
+
+                // Calculate number of registers set to zero.
+                let zeros = self.counts.1 - self.sparse.count();
+                // Use linear counting to approximate.
+                Ok(Self::linear_count(self.counts.1, zeros))
+            }
+        }
+    }
+
+
     /// Merges the `other` HyperLogLogPlus instance into `self`.
     ///
     /// Both sketches must have the same precision. Merge can trigger
     /// the transition from sparse to normal representation.
     ///
-    pub fn merge<S>(&mut self, other: &HyperLogLogPlus<S>) -> Result<(), HyperLogLogError>
+    fn merge_impl<S>(&mut self, other: &HyperLogLogPlus<S>) -> Result<(), HyperLogLogError>
     where
         S: Hash + ?Sized,
     {
@@ -270,7 +384,8 @@ where
         Ok(())
     }
 
-    pub fn compact_merge<S>(&mut self, other: &HyperLogLogPlus<S>) -> Result<(), HyperLogLogError>
+    /// Compact merge is similar to merge but does not use counters.
+    fn compact_merge_impl<S>(&mut self, other: &HyperLogLogPlus<S>) -> Result<(), HyperLogLogError>
     where
         S: Hash + ?Sized,
     {
@@ -352,24 +467,14 @@ where
         Ok(())
     }
 
-    /// Inserts a new value, of any type, to the multiset.
-    pub fn insert_any<R>(&mut self, value: &R) -> Result<(), HyperLogLogError>
-    where
-        R: Hash + ?Sized,
-    {
-        self.insert_impl(value)
-    }
-
     #[inline(always)]
     fn insert_impl<R>(&mut self, value: &R) -> Result<(), HyperLogLogError>
     where
         R: Hash + ?Sized,
     {
-        // Create a new hasher.
         // Calculate the hash.
         let sip = &mut self.builder.clone();
         value.hash(sip);
-        // Use a 64-bit hash value.
         let mut hash: u64 = sip.finish();
 
         match &mut self.registers {
@@ -449,7 +554,6 @@ where
                 let zeros: u32 = 1 + hash.leading_zeros();
 
                 // Delete from register_counters
-
                 if !self.register_counters.contains_key(&(index as u16)) {
                     return Err(HyperLogLogError::InvalidDenseDelete(
                         index as u32,
@@ -792,75 +896,7 @@ where
     }
 }
 
-impl<H> HyperLogLogCommon for HyperLogLogPlus<H> where H: Hash + ?Sized {}
 
-impl<H> HyperLogLog<H> for HyperLogLogPlus<H>
-where
-    H: Hash + ?Sized,
-{
-    /// Inserts a new value to the multiset.
-    fn insert<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError>
-    where
-        H: Borrow<Q>,
-        Q: Hash + ?Sized,
-    {
-        self.insert_impl(value)
-    }
-
-    /// Estimates the cardinality of the multiset.
-    fn count(&mut self) -> Result<f64, HyperLogLogError> {
-        // Merge tmpset into sparse representation.
-        if self.registers.is_none() {
-            self.merge_sparse()?;
-            self.merge_del_sparse()?;
-        }
-
-        match self.registers.as_mut() {
-            Some(registers) => {
-                // We use normal representation.
-
-                let zeros = registers.zeros();
-
-                if zeros != 0 {
-                    let correction = Self::linear_count(self.counts.0, zeros);
-
-                    // Use linear counting only if value below threshold.
-                    if correction <= Self::threshold(self.precision) {
-                        Ok(correction)
-                    } else {
-                        // Calculate the raw estimate.
-                        let mut raw = Self::estimate_raw_plus(registers.iter(), self.counts.0);
-
-                        // Apply correction if required.
-                        if raw <= 5.0 * self.counts.0 as f64 {
-                            raw -= self.estimate_bias(raw);
-                        }
-
-                        Ok(raw)
-                    }
-                } else {
-                    // Calculate the raw estimate.
-                    let mut raw = Self::estimate_raw_plus(registers.iter(), self.counts.0);
-
-                    // Apply correction if required.
-                    if raw <= 5.0 * self.counts.0 as f64 {
-                        raw -= self.estimate_bias(raw);
-                    }
-
-                    Ok(raw)
-                }
-            }
-            None => {
-                // We use sparse representation.
-
-                // Calculate number of registers set to zero.
-                let zeros = self.counts.1 - self.sparse.count();
-                // Use linear counting to approximate.
-                Ok(Self::linear_count(self.counts.1, zeros))
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -895,8 +931,8 @@ mod tests {
         // Generate random elements in the range 1-500
         for _ in 0..num_elements {
             let x = rng.gen_range(1, 50);
-            hll1.insert_any(&x).unwrap();
-            hll2.insert_any(&x).unwrap();
+            hll1.insert(&x).unwrap();
+            hll2.insert(&x).unwrap();
         }
 
         (hll1, hll2)
@@ -969,14 +1005,14 @@ mod tests {
         for _ in 0..num_elements {
             let x = rng.gen_range(1, 50000);
             set1.insert(x);
-            hll1.insert_any(&x).unwrap();
+            hll1.insert(&x).unwrap();
         }
 
         // Generate different random elements in the range 50001-100000 for hll2
         for _ in 0..num_elements {
             let x = rng.gen_range(50001, 100000);
             set2.insert(x);
-            hll2.insert_any(&x).unwrap();
+            hll2.insert(&x).unwrap();
         }
 
         (set1, hll1, set2, hll2)
@@ -1085,7 +1121,7 @@ mod tests {
 
         // Insert elements into the HyperLogLogPlus
         for element in elements.iter() {
-            hll.insert_any(element).unwrap();
+            hll.insert(element).unwrap();
         }
 
         // Check the estimate
@@ -1111,7 +1147,7 @@ mod tests {
         for _ in 0..5000 {
             let val: u32 = rng.gen_range(0, 1000);
             test_set.push(val);
-            hll.insert_any(&val).unwrap();
+            hll.insert(&val).unwrap();
         }
         let count = hll.count().unwrap();
         let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
@@ -1142,7 +1178,7 @@ mod tests {
         for _ in 0..5000 {
             let val: u32 = rng.gen_range(0, 50);
             test_set.push(val);
-            hll.insert_any(&val).unwrap();
+            hll.insert(&val).unwrap();
         }
 
         assert!(hll.is_sparse());
@@ -1180,7 +1216,7 @@ mod tests {
         for _ in 0..20000 {
             let val: u32 = rng.gen_range(0, 10000);
             test_set.push(val);
-            hll.insert_any(&val).unwrap();
+            hll.insert(&val).unwrap();
         }
         let count = hll.count().unwrap();
         let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
@@ -1209,7 +1245,7 @@ mod tests {
         for _ in 0..20000 {
             let val: u32 = rng.gen_range(0, 500);
             test_set.push(val);
-            hll.insert_any(&val).unwrap();
+            hll.insert(&val).unwrap();
         }
         let count = hll.count().unwrap();
         let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
@@ -1240,7 +1276,7 @@ mod tests {
     #[test]
     fn test_insert_any_with_random_inputs() {
         let mut rng = rand::thread_rng(); // Create a random number generator
-        let mut hll = HyperLogLogPlus::<i32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
 
         // Generate 1000 random elements in the range 1-500
         let mut elements: Vec<u32> = Vec::with_capacity(100000);
@@ -1251,7 +1287,7 @@ mod tests {
 
         // Insert elements into the HyperLogLogPlus
         for element in elements.iter() {
-            hll.insert_any(element).unwrap();
+            hll.insert(element).unwrap();
         }
 
         // Calculate the actual cardinality by deduplicating the elements
@@ -1380,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_sparse_to_normal_complex() {
-        let mut hll = HyperLogLogPlus::<i32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
         let mut rng = rand::thread_rng();
 
         // Generate 10000 random elements in the range 1-500
@@ -1391,7 +1427,7 @@ mod tests {
         }
         // Insert elements into the HyperLogLogPlus
         for element in &elements {
-            hll.insert_any(element).unwrap();
+            hll.insert(element).unwrap();
         }
 
         // Check the estimate
@@ -1419,7 +1455,7 @@ mod tests {
 
     #[test]
     fn test_sparse_to_normal_complex_with_deletes() {
-        let mut hll = HyperLogLogPlus::<i32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
         let mut rng = rand::thread_rng();
         // Generate 10000 random elements in the range 1-5000
         let mut elements: Vec<u32> = Vec::with_capacity(10000);
@@ -1432,7 +1468,7 @@ mod tests {
 
         // Insert elements into the HyperLogLogPlus
         for element in &elements {
-            hll.insert_any(element).unwrap();
+            hll.insert(element).unwrap();
         }
 
         // Generate 2000 random indices for deletion
@@ -1772,7 +1808,7 @@ mod tests {
 
     #[test]
     fn test_serialization_deserialization_sparse() {
-        let mut hll1 =HyperLogLogPlus::<i32>::new(14).unwrap();
+        let mut hll1 =HyperLogLogPlus::<u32>::new(14).unwrap();
 
         let mut rng = rand::thread_rng();
 
@@ -1785,7 +1821,7 @@ mod tests {
 
         // Insert elements into the HyperLogLogPlus
         for element in elements.iter() {
-            hll1.insert_any(element).unwrap();
+            hll1.insert(element).unwrap();
         }
 
         // Serialize
@@ -1798,7 +1834,7 @@ mod tests {
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll2.count().unwrap());
 
-        hll2.insert_any(&501).unwrap();
+        hll2.insert(&501).unwrap();
 
         assert!(hll2.count().is_err());
 
@@ -1811,9 +1847,9 @@ mod tests {
         assert_eq!(hll1.count().unwrap(), hll3.count().unwrap());
         let cur_cnt = hll1.count().unwrap();
 
-        hll3.insert_any(&501).unwrap();
+        hll3.insert(&501).unwrap();
         assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )).abs() < 0.0001);
-        hll3.insert_any(&501).unwrap();
+        hll3.insert(&501).unwrap();
         assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )).abs() < 0.0001);
 
         hll3.delete_any(&501).unwrap();
@@ -1829,7 +1865,7 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         // Generate 10000 random elements in the range 1-50000
-        let mut elements: HashSet<u32> = HashSet::with_capacity(100);
+        let mut elements: HashSet<i32> = HashSet::with_capacity(100);
         for _ in 0..10000 {
             let x = rng.gen_range(1, 500);
             elements.insert(x);
@@ -1839,7 +1875,7 @@ mod tests {
 
         // Insert elements into the HyperLogLogPlus
         for element in elements.iter() {
-            hll1.insert_any(element).unwrap();
+            hll1.insert(element).unwrap();
         }
 
         // Serialize
@@ -1861,10 +1897,10 @@ mod tests {
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll3.count().unwrap());
 
-        hll3.insert_any(&50011).unwrap();
+        hll3.insert(&50011).unwrap();
         println!("{} {}", hll3.count().unwrap(), cur_cnt);
         assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )) < 0.1);
-        hll3.insert_any(&50011).unwrap();
+        hll3.insert(&50011).unwrap();
         assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )) < 0.1);
 
         hll3.delete_any(&50011).unwrap();
