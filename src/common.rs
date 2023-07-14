@@ -3,110 +3,90 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "alloc")]
 use alloc::{vec, vec::Vec};
 
-// A macro to create `Registers` structs for different Register sizes.
-macro_rules! registers_impls {
-    ($len:expr, $ident:ident) => {
-        // A Registers struct.
-        #[derive(Clone, Debug, Serialize, Deserialize)]
-        pub struct $ident {
-            // A buffer containing registers.
-            buf:   Vec<u32>,
-            // The number of registers stored in buf.
-            count: usize,
-            // The number of registers set to zero.
-            zeros: usize,
-        }
-
-        impl $ident {
-            // The register's size (in bits).
-            pub const SIZE: usize = $len;
-            // The number of registers that fit in a 32-bit integer.
-            const COUNT_PER_WORD: usize = 32 / Self::SIZE;
-            // A mask to get the lower register (from LSB).
-            const MASK: u32 = (1 << Self::SIZE) - 1;
-
-            // Creates a new Registers struct with capacity `count` registers.
-            pub fn with_count(count: usize) -> $ident {
-                $ident {
-                    buf:   vec![0; ceil(count, Self::COUNT_PER_WORD)],
-                    count: count,
-                    zeros: count,
-                }
-            }
-
-            #[inline] // Returns an iterator that emits Register values.
-            pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-                self.buf
-                    .iter()
-                    .map(|val| {
-                        (0..Self::COUNT_PER_WORD).map(move |i| {
-                            ((val >> i * Self::SIZE) & Self::MASK)
-                        })
-                    })
-                    .flatten()
-                    .take(self.count)
-            }
-
-            #[inline] // Returns the value of the Register at `index`.
-            #[allow(dead_code)]
-            pub fn get(&self, index: usize) -> u32 {
-                let (qu, rm) = (
-                    index / Self::COUNT_PER_WORD,
-                    index % Self::COUNT_PER_WORD,
-                );
-
-                (self.buf[qu] >> (rm * Self::SIZE)) & Self::MASK
-            }
-
-            #[inline] // Sets the value of the Register at `index` to `value`,
-                      // if `value` is greater than its current value.
-            pub fn set_greater(&mut self, index: usize, value: u32) {
-                let (qu, rm) = (
-                    index / Self::COUNT_PER_WORD,
-                    index % Self::COUNT_PER_WORD,
-                );
-
-                let cur = (self.buf[qu] >> (rm * Self::SIZE)) & Self::MASK;
-
-                if value > cur {
-                    if cur == 0 {
-                        self.zeros -= 1;
-                        self.buf[qu] |= (value << (rm * Self::SIZE));
-                    } else {
-                        let mask = Self::MASK << (rm * Self::SIZE);
-
-                        self.buf[qu] = (self.buf[qu] & !mask) |
-                            (value << (rm * Self::SIZE));
-                    }
-                }
-            }
-
-            #[inline]
-            pub fn zeros(&self) -> usize {
-                self.zeros
-            }
-
-            #[inline] // Returns the size of the Registers in bytes
-            #[allow(dead_code)] // for a given number of Registers.
-            pub fn size_in_bytes(count: usize) -> usize {
-                4 * count / Self::COUNT_PER_WORD
-            }
-        }
-    };
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegistersPlus {
+    buf: Vec<u32>,
+    count: usize,
+    zeros: usize,
 }
 
-// Registers implementation for 5-bit registers,
-// used by HyperLogLog original implementation.
-//
-// Available also with no_std.
-registers_impls![5, Registers];
+impl RegistersPlus {
+    pub const SIZE: usize = 6;
+    // The number of registers that fit in a 32-bit integer.
+    const COUNT_PER_WORD: usize = 5;
+    const MASK: u32 = (1 << Self::SIZE) - 1;
 
-// Registers implementation for 6-bit registers,
-// used by HyperLogLog++ implementation.
-//
-// Available only with std.
-#[cfg(feature = "std")]
-registers_impls![6, RegistersPlus];
+    pub fn with_count(count: usize) -> RegistersPlus {
+        RegistersPlus {
+            buf: vec![0; ceil(count, Self::COUNT_PER_WORD)],
+            count: count,
+            zeros: count,
+        }
+    }
+
+    pub fn mem_size(&self) -> usize {
+        self.buf.len() * std::mem::size_of::<u32>()
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.buf
+            .iter()
+            .map(|val| (0..Self::COUNT_PER_WORD).map(move |i| (val >> i * Self::SIZE) & Self::MASK))
+            .flatten()
+            .take(self.count)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn get(&self, index: usize) -> u32 {
+        let (qu, rm) = (index / Self::COUNT_PER_WORD, index % Self::COUNT_PER_WORD);
+
+        (self.buf[qu] >> (rm * Self::SIZE)) & Self::MASK
+    }
+
+    #[inline]
+    pub fn set_greater(&mut self, index: usize, value: u32) {
+        let (qu, rm) = (index / Self::COUNT_PER_WORD, index % Self::COUNT_PER_WORD);
+
+        let cur = (self.buf[qu] >> (rm * Self::SIZE)) & Self::MASK;
+
+        if value > cur {
+            if cur == 0 {
+                self.zeros -= 1;
+                self.buf[qu] |= value << (rm * Self::SIZE);
+            } else {
+                let mask = Self::MASK << (rm * Self::SIZE);
+
+                self.buf[qu] = (self.buf[qu] & !mask) | (value << (rm * Self::SIZE));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set_register(&mut self, index: usize, cur: u32) {
+        let (qu, rm) = (index / Self::COUNT_PER_WORD, index % Self::COUNT_PER_WORD);
+        if cur == 0 {
+            self.zeros += 1;
+            self.buf[qu] |= cur << (rm * Self::SIZE);
+        } else {
+            let mask = Self::MASK << (rm * Self::SIZE);
+
+            self.buf[qu] = (self.buf[qu] & !mask) | (cur << (rm * Self::SIZE));
+        }
+    }
+
+    #[inline]
+    pub fn zeros(&self) -> usize {
+        self.zeros
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn size_in_bytes(count: usize) -> usize {
+        4 * count / Self::COUNT_PER_WORD
+    }
+}
 
 // An array containing all possible values used to calculate
 // the "raw" sum.
@@ -115,30 +95,20 @@ registers_impls![6, RegistersPlus];
 //
 // This is used only in the case the `const-loop` feature is enabled,
 // it requires a Rust compiler version 1.45.0 or higher.
-macro_rules! rawlut_impls {
-    ($ident:ident) => {
-        #[cfg(feature = "const-loop")]
-        const RAW: [f64; 1 << $ident::SIZE] = {
-            const COUNT: usize = 1 << $ident::SIZE;
+#[cfg(feature = "const-loop")]
+const RAW: [f64; 1 << RegistersPlus::SIZE] = {
+    const COUNT: usize = 1 << RegistersPlus::SIZE;
 
-            let mut raw = [0.0; COUNT];
+    let mut raw = [0.0; COUNT];
 
-            let mut i = 0;
-            while i < COUNT {
-                raw[i] = 1.0 / (1u64 << i) as f64;
-                i += 1;
-            }
+    let mut i = 0;
+    while i < COUNT {
+        raw[i] = 1.0 / (1u64 << i) as f64;
+        i += 1;
+    }
 
-            raw
-        };
-    };
-}
-
-#[cfg(not(feature = "std"))]
-rawlut_impls![Registers];
-
-#[cfg(feature = "std")]
-rawlut_impls![RegistersPlus];
+    raw
+};
 
 // A trait for sharing common HyperLogLog related functionality between
 // different HyperLogLog implementations.
@@ -250,21 +220,6 @@ impl BitExtract<u32> for u32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_registers_get_set() {
-        let mut registers: Registers = Registers::with_count(10);
-
-        assert_eq!(registers.buf.len(), 2);
-
-        registers.set_greater(1, 0b11);
-
-        assert_eq!(registers.buf, vec![0b1100000, 0]);
-
-        registers.set_greater(9, 0x7);
-
-        assert_eq!(registers.buf, vec![0b1100000, 0x038000]);
-    }
-
     #[cfg(feature = "std")]
     #[test]
     fn test_registers_get_set_plus() {
@@ -279,40 +234,6 @@ mod tests {
         registers.set_greater(9, 0x7);
 
         assert_eq!(registers.buf, vec![0b11000000, 0x07000000]);
-    }
-
-    #[test]
-    fn test_registers_set_greater() {
-        let mut registers: Registers = Registers::with_count(10);
-
-        assert_eq!(registers.buf.len(), 2);
-
-        assert_eq!(registers.zeros(), 10);
-
-        registers.set_greater(1, 0);
-
-        assert_eq!(registers.buf, vec![0, 0]);
-        assert_eq!(registers.zeros(), 10);
-
-        registers.set_greater(1, 0b11);
-
-        assert_eq!(registers.buf, vec![0b1100000, 0]);
-        assert_eq!(registers.zeros(), 9);
-
-        registers.set_greater(9, 0x7);
-
-        assert_eq!(registers.buf, vec![0b1100000, 0x038000]);
-        assert_eq!(registers.zeros(), 8);
-
-        registers.set_greater(1, 0b10);
-
-        assert_eq!(registers.buf, vec![0b1100000, 0x038000]);
-        assert_eq!(registers.zeros(), 8);
-
-        registers.set_greater(9, 0x9);
-
-        assert_eq!(registers.buf, vec![0b1100000, 0x048000]);
-        assert_eq!(registers.zeros(), 8);
     }
 
     #[cfg(feature = "std")]
