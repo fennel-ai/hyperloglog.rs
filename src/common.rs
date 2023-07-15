@@ -48,16 +48,13 @@ impl RegistersPlus {
     #[inline]
     pub fn set_greater(&mut self, index: usize, value: u32) {
         let (qu, rm) = (index / Self::COUNT_PER_WORD, index % Self::COUNT_PER_WORD);
-
         let cur = (self.buf[qu] >> (rm * Self::SIZE)) & Self::MASK;
-
         if value > cur {
             if cur == 0 {
                 self.zeros -= 1;
                 self.buf[qu] |= value << (rm * Self::SIZE);
             } else {
                 let mask = Self::MASK << (rm * Self::SIZE);
-
                 self.buf[qu] = (self.buf[qu] & !mask) | (value << (rm * Self::SIZE));
             }
         }
@@ -68,12 +65,10 @@ impl RegistersPlus {
         let (qu, rm) = (index / Self::COUNT_PER_WORD, index % Self::COUNT_PER_WORD);
         if cur == 0 {
             self.zeros += 1;
-            self.buf[qu] |= cur << (rm * Self::SIZE);
-        } else {
-            let mask = Self::MASK << (rm * Self::SIZE);
-
-            self.buf[qu] = (self.buf[qu] & !mask) | (cur << (rm * Self::SIZE));
         }
+
+        let mask = Self::MASK << (rm * Self::SIZE);
+        self.buf[qu] = (self.buf[qu] & !mask) | (cur << (rm * Self::SIZE));
     }
 
     #[inline]

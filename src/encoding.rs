@@ -88,39 +88,99 @@ impl VarIntVec {
     }
 }
 
-// A Vector of bytes containing run length and variable length encoded unsigned integers.
-// The vector is similar to a VarIntVec, but it also encodes runs of zeros.
-// Hence if a number in the vector is zero, the next byte stores the count of consecutive zeros.
-// The vector also always terminates with a non zero number.
-// All numbers after the last key are assumed to be zero.
+/// Map of the number of leading zeros to the count of numbers with that many leading zeros.
+/// Hence it is map of u8 to u32.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunEncodedVarInt(Vec<u8>);
+pub struct ZeroCountMap(Vec<u8>);
 
-impl RunEncodedVarInt {
-    // The terminology used in the implementation is as follows:
-    // `index` is the index of the byte in the  byte vector.
-    // `key` is the index of the key we are looking at. For our purpose the key is a number between 0 and 50.
-
+impl ZeroCountMap {
     pub fn new() -> Self {
-        RunEncodedVarInt(Vec::new())
+        ZeroCountMap(Vec::new())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn increase_count_at_index(&mut self, key: u8, val: u32) {
+        if val == 0 {
+            return;
+        }
+        assert!(key > 0);
+
+        let mut values = self.convert_to_vec();
+        let len: u8 = values.len() as u8;
+        if key < len {
+            values[key as usize] += val;
+        } else if key == len {
+            values.push(val);
+        } else {
+            self.0.push(0);
+            self.0.push(key - len);
+            self.push_non_zero(val);
+            return;
+        }
+
+        self.encode_vec_to_buf(values);
+    }
+
+    // Returns true if the count at index is zero after decreasing it by val.
+    pub fn decrease_count_at_index(&mut self, key: u8, val: u32) -> Result<bool, HyperLogLogError> {
+        if val == 0 {
+            return Ok(false);
+        }
+        assert!(key > 0);
+
+        let mut values = self.convert_to_vec();
+
+        let val_is_zero;
+        if values.len() > key as usize {
+            if values[key as usize] < val {
+                return Err(HyperLogLogError::InvalidDenseDelete(
+                    val,
+                    values[key as usize],
+                ));
+            }
+            values[key as usize] -= val;
+            val_is_zero = values[key as usize] == 0;
+        } else {
+            return Err(HyperLogLogError::InvalidDenseDelete(
+                key as u32,
+                values.len() as u32,
+            ));
+        }
+
+
+        self.encode_vec_to_buf(values);
+
+        Ok(val_is_zero)
+    }
+
+    pub fn arg_max(&self) -> u32 {
+        let values = self.convert_to_vec();
+        // The last value is guaranteed to be non zero.
+        (values.len() - 1) as u32
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
         self.0.clone()
     }
 
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, HyperLogLogError> {
-        Ok(RunEncodedVarInt(bytes))
+    pub fn deserialize(bytes: Vec<u8>) -> Result<Self, HyperLogLogError> {
+        Ok(ZeroCountMap(bytes))
     }
 
     pub fn mem_size(&self) -> usize {
         self.0.len() * std::mem::size_of::<u8>()
     }
 
-    #[allow(dead_code)]
-    pub fn with_capacity(cap: usize) -> Self {
-        RunEncodedVarInt(Vec::with_capacity(cap))
-    }
+    // -------------------------------- Internal Functions -----------------------------------------
+    // Encoding Scheme:
+    // A Vector of bytes containing run length and variable length encoded unsigned integers.
+    // The vector is similar to a VarIntVec, but it also encodes runs of zeros.
+    // Hence if a number in the vector is zero, the next byte stores the count of consecutive zeros.
+    // The vector also always terminates with a non zero number.
+    // All numbers after the last key are assumed to be zero.
+
+    // The terminology used in the implementation is as follows:
+    // `index` is the index of the byte in the  byte vector.
+    // `key` is the index of the key we are looking at. For our purpose the key is a number between 0 and 50.
 
     #[inline] // Varint encodes `val` and pushes it into the vector.
     fn push_non_zero(&mut self, mut val: u32) {
@@ -170,65 +230,6 @@ impl RunEncodedVarInt {
                 self.push_non_zero(v);
             }
         }
-    }
-
-    pub fn increase_count_at_index(&mut self, key: u8, val: u32) {
-        if val == 0 {
-            return;
-        }
-        assert!(key > 0);
-
-        let mut values = self.convert_to_vec();
-        let len: u8 = values.len() as u8;
-        if key < len {
-            values[key as usize] += val;
-        } else if key == len {
-            values.push(val);
-        } else {
-            self.0.push(0);
-            self.0.push(key - len);
-            self.push_non_zero(val);
-            return;
-        }
-
-        self.encode_vec_to_buf(values);
-    }
-
-    // Returns true if the count at index is zero after decreasing it by val.
-    pub fn decrease_count_at_index(&mut self, key: u8, val: u32) -> Result<bool, HyperLogLogError> {
-        if val == 0 {
-            return Ok(false);
-        }
-        assert!(key > 0);
-
-        let mut values = self.convert_to_vec();
-
-        let val_is_zero;
-        if values.len() > key as usize {
-            if values[key as usize] < val {
-                return Err(HyperLogLogError::InvalidDenseDelete(
-                    key as u32,
-                    values.len() as u32,
-                ));
-            }
-            values[key as usize] -= val;
-            val_is_zero = values[key as usize] == 0;
-        } else {
-            return Err(HyperLogLogError::InvalidDenseDelete(
-                key as u32,
-                values.len() as u32,
-            ));
-        }
-
-        self.encode_vec_to_buf(values);
-
-        Ok(val_is_zero)
-    }
-
-    pub fn arg_max(&self) -> u32 {
-        let values = self.convert_to_vec();
-        // The last value is guaranteed to be non zero.
-        (values.len() - 1) as u32
     }
 
     #[inline] // Varint decodes a number starting at `index`.
@@ -437,14 +438,14 @@ mod tests {
     #[test]
     fn test_arg_max() {
         // Test with non-zero elements
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         v.increase_count_at_index(2, 1);
         v.increase_count_at_index(3, 9);
         assert_eq!(v.arg_max(), 3);
 
         // Test with all elements being zeros except the last one
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         for i in 1..63 {
             v.increase_count_at_index(i, 0);
         }
@@ -452,18 +453,18 @@ mod tests {
         assert_eq!(v.arg_max(), 63);
 
         // Test with all elements being the same non-zero number
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         for i in 1..64 {
             v.increase_count_at_index(i, 7);
         }
         assert_eq!(v.arg_max(), 63);
 
-        // Test with empty RunEncodedVarInt
-        let v = RunEncodedVarInt::new();
+        // Test with empty ZeroCountMap
+        let v = ZeroCountMap::new();
         assert_eq!(v.arg_max(), 0);
 
         // Insert and delete some elements
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         v.increase_count_at_index(2, 1);
         v.increase_count_at_index(3, 9);
@@ -472,7 +473,7 @@ mod tests {
         assert_eq!(v.arg_max(), 3);
 
         // Insert elements, then delete all of them
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         v.increase_count_at_index(2, 1);
         assert!(v.decrease_count_at_index(1, 5).is_ok());
@@ -480,7 +481,7 @@ mod tests {
         assert_eq!(v.arg_max(), 0);
 
         // Delete an element that doesn't exist
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         assert!(v.decrease_count_at_index(2, 1).is_err());
         assert_eq!(v.arg_max(), 1);
@@ -489,14 +490,14 @@ mod tests {
     #[test]
     fn test_run_encoded_vec_increase_count() {
         // Test with non-zero elements
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         v.increase_count_at_index(2, 1);
         v.increase_count_at_index(3, 9);
         assert_eq!(v.convert_to_vec(), vec![0, 5, 1, 9]);
 
         // Test with zeros
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 0);
         v.increase_count_at_index(2, 0);
         v.increase_count_at_index(3, 0);
@@ -504,7 +505,7 @@ mod tests {
         assert_eq!(v.convert_to_vec(), vec![0]);
 
         // Test with mix of zeros and non-zeros
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 3);
         v.increase_count_at_index(2, 0);
         v.increase_count_at_index(3, 0);
@@ -518,7 +519,7 @@ mod tests {
     #[test]
     fn test_decrease_count_at_index() {
         // Test with non-zero elements
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         v.increase_count_at_index(2, 1);
         v.increase_count_at_index(3, 9);
@@ -527,7 +528,7 @@ mod tests {
         assert_eq!(v.convert_to_vec(), vec![0, 3, 1, 6]);
 
         // Test decrease to zero
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         v.increase_count_at_index(2, 1);
         assert!(v.decrease_count_at_index(1, 5).is_ok());
@@ -535,7 +536,7 @@ mod tests {
         assert_eq!(v.convert_to_vec(), vec![0]);
 
         // Test with mix of zeros and non-zeros
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 3);
         v.increase_count_at_index(2, 0);
         v.increase_count_at_index(3, 0);
@@ -548,7 +549,7 @@ mod tests {
         assert_eq!(v.convert_to_vec(), vec![0, 2, 0, 0, 0, 1]);
 
         // Test with out of range key and decrease more than available
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 3);
         assert!(v.decrease_count_at_index(2, 1).is_err());
         assert!(v.decrease_count_at_index(1, 4).is_err());
@@ -557,7 +558,7 @@ mod tests {
     #[test]
     fn test_run_encoded_vec_increase_count_complex() {
         // Test with a large number of zeros in between non-zeros
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         v.increase_count_at_index(1, 5);
         for i in 1..50 {
             v.increase_count_at_index(i, 0);
@@ -572,7 +573,7 @@ mod tests {
         assert_eq!(v.mem_size(), 4);
 
         // Test with all elements being zeros except the last one
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         for i in 0..63 {
             v.increase_count_at_index(i, 0);
         }
@@ -585,7 +586,7 @@ mod tests {
         assert_eq!(v.mem_size(), 3);
 
         // Test with all elements being the same non-zero number
-        let mut v = RunEncodedVarInt::new();
+        let mut v = ZeroCountMap::new();
         for i in 1..64 {
             v.increase_count_at_index(i, 7);
         }

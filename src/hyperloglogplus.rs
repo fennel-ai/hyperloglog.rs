@@ -1,14 +1,14 @@
+use bytes::Bytes;
 use core::fmt::Debug;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
 use std::marker::PhantomData;
-use bytes::Bytes;
 
 use crate::common::*;
 use crate::constants;
-use crate::encoding::{DifIntVec, RunEncodedVarInt, VarIntVec};
+use crate::encoding::{DifIntVec, ZeroCountMap, VarIntVec};
 use crate::HyperLogLog;
 use crate::HyperLogLogError;
 use siphasher::sip::SipHasher13;
@@ -69,33 +69,43 @@ where
     precision: u8,
     builder: SipHasher13,
     counts: (usize, usize, usize),
+
+    // Data structures for sparse representation.
+
     insert_tmpset: HashMap<u32, u32>,
     del_tmpset: HashMap<u32, u32>,
     sparse: DifIntVec,
-    // Store the counters in a separate vector for sparse representation.
     sparse_counters: VarIntVec,
+
+    // Data structures for dense representation.
+
     registers: Option<RegistersPlus>,
-    register_counters: HashMap<u16, RunEncodedVarInt>,
+    register_counters: HashMap<u16, ZeroCountMap>,
+
     phantom: PhantomData<H>,
 }
 
 impl<H> HyperLogLogCommon for HyperLogLogPlus<H> where H: Hash + ?Sized {}
 
 impl<H> HyperLogLog<H> for HyperLogLogPlus<H>
-    where
-        H: Hash + ?Sized,
+where
+    H: Hash + ?Sized,
 {
     /// Inserts a new value to the multiset.
     fn insert<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError>
-        where
-            H: Borrow<Q>,
-            Q: Hash + ?Sized,
+    where
+        H: Borrow<Q>,
+        Q: Hash + ?Sized,
     {
         self.insert_impl(value)
     }
 
     /// Deletes a value from the multiset.
-    fn delete<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError> where H: Borrow<Q>, Q: Hash + ?Sized {
+    fn delete<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError>
+    where
+        H: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         self.delete_impl(value)
     }
 
@@ -105,12 +115,12 @@ impl<H> HyperLogLog<H> for HyperLogLogPlus<H>
     }
 
     /// Merges another HyperLogLogPlus into this one.
-    fn merge(&mut self, other: &HyperLogLogPlus<H>) ->  Result<(), HyperLogLogError> {
+    fn merge(&mut self, other: &HyperLogLogPlus<H>) -> Result<(), HyperLogLogError> {
         self.merge_impl(other)
     }
 
     /// Merges another HyperLogLogPlus into this one without using any counter data.
-    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) ->  Result<(), HyperLogLogError> {
+    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) -> Result<(), HyperLogLogError> {
         self.compact_merge_impl(other)
     }
 
@@ -121,16 +131,19 @@ impl<H> HyperLogLog<H> for HyperLogLogPlus<H>
 
     /// Deserializes a byte array into a HyperLogLogPlus.
     fn deserialize(bytes: &[u8]) -> Result<Self, HyperLogLogError>
-    where Self: Sized
+    where
+        Self: Sized,
     {
         HyperLogLogPlus::from_bytes(bytes)
     }
 
     /// Deserializes a byte array into a HyperLogLogPlus without loading any counter data.
-    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError> where Self: Sized {
+    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    where
+        Self: Sized,
+    {
         HyperLogLogPlus::from_bytes_compact(bytes)
     }
-
 
     /// Returns the estimate of the memory used by the multiset.
     fn mem_size(&mut self) -> usize {
@@ -187,11 +200,11 @@ where
         let self_size = std::mem::size_of_val(self);
         let insert_tmpset_size = self.insert_tmpset.len() * (std::mem::size_of::<u32>() * 2);
         let del_tmpset_size = self.del_tmpset.len() * (std::mem::size_of::<u32>() * 2);
-        let sparse_size = self.sparse.mem_size(); // Replace ElementType with the actual type
+        let sparse_size = self.sparse.mem_size();
         let sparse_counters_size = self.sparse_counters.mem_size();
 
         let registers_size = match &self.registers {
-            Some(registers) => registers.mem_size(), // Assuming that RegistersPlus contains a buf: Vec<u32>
+            Some(registers) => registers.mem_size(),
             None => 0,
         };
 
@@ -210,11 +223,17 @@ where
             + register_counters_size
     }
 
+    #[inline] // Returns true if the HyperLogLog is using the
+    // sparse representation.
+    pub fn is_sparse(&self) -> bool {
+        self.registers.is_none()
+    }
+
+
     fn count_impl(&mut self) -> Result<f64, HyperLogLogError> {
         // Merge tmpset into sparse representation.
-        if self.registers.is_none() {
+        if self.is_sparse() {
             self.merge_sparse()?;
-            self.merge_del_sparse()?;
         }
 
         match self.registers.as_mut() {
@@ -254,7 +273,6 @@ where
             }
             None => {
                 // We use sparse representation.
-
                 // Calculate number of registers set to zero.
                 let zeros = self.counts.1 - self.sparse.count();
                 // Use linear counting to approximate.
@@ -262,7 +280,6 @@ where
             }
         }
     }
-
 
     /// Merges the `other` HyperLogLogPlus instance into `self`.
     ///
@@ -277,9 +294,12 @@ where
             return Err(HyperLogLogError::IncompatiblePrecision);
         }
 
+        // If any of the sketches is in dense representation, we need to
+        // merge them into a dense representation.
+
         if other.is_sparse() {
             if self.is_sparse() {
-                // Self -> Sparse, Other -> Sparse
+                // Self -> Sparse, Other -> Sparse => Sparse
                 // Both sketches are in sparse representation.
                 //
                 // Insert all the hash codes of other into `tmpset`.
@@ -304,17 +324,17 @@ where
 
                 // Merge temporary del set into sparse representation.
                 if self.del_tmpset.len() * 100 > self.counts.2 {
-                    self.merge_del_sparse()?;
+                    self.merge_deletes_sparse()?;
                 }
 
                 // Merge temporary set into sparse representation.
-                // RHS is number of registers in sparse representation * 0.8 = 2^14 * 0.8  = 13k
-                // So roughly every 130 inserts we flush.
                 if self.insert_tmpset.len() * 100 > self.counts.2 {
-                    self.merge_sparse()?;
+                    self.merge_inserts_sparse()?;
                 }
+
+                self.convert_to_dense_if_required();
             } else {
-                // Self -> Dense, Other -> Sparse
+                // Self -> Dense, Other -> Sparse => Dense
 
                 // The other sketch is in sparse representation but not self.
                 //
@@ -322,17 +342,15 @@ where
                 // corresponding Registers.
 
                 // Update the counts from the sparse representation into the dense representation.
-
                 let registers = self.registers.as_mut().unwrap();
 
                 // Handle the temporary insert and delete sets
-
                 for (hash_code, cnt) in other.insert_tmpset.iter() {
                     let (zeros, index) = other.decode_hash(*hash_code);
                     let counter_map = self
                         .register_counters
                         .entry(index as u16)
-                        .or_insert(RunEncodedVarInt::new());
+                        .or_insert(ZeroCountMap::new());
                     counter_map.increase_count_at_index(zeros as u8, *cnt);
                     registers.set_greater(index, zeros);
                 }
@@ -340,24 +358,27 @@ where
                 // Empty the delete set
                 for (hash_code, cnt) in other.del_tmpset.iter() {
                     let (zeros, index) = other.decode_hash(*hash_code);
+                    if !self.register_counters.contains_key(&(index as u16)) {
+                        continue;
+                    }
                     let counter_map = self.register_counters.get_mut(&(index as u16)).unwrap();
                     if counter_map.decrease_count_at_index(zeros as u8, *cnt)? {
                         let new_max_zeros = counter_map.arg_max();
                         registers.set_register(index, new_max_zeros);
+                        if new_max_zeros == 0 {
+                            self.register_counters.remove(&(index as u16));
+                        }
                     }
                 }
 
                 // Handle the main sparse representation
-
-                // We ignore the counts, because they wont affect the final result.
                 for hash_code in other.sparse.into_iter() {
                     let (zeros, index) = other.decode_hash(hash_code);
-
                     registers.set_greater(index, zeros);
                 }
             }
         } else {
-            //  Other -> Dense
+            //  Other -> Dense => Dense
 
             // Convert self from sparse to normal representation.
             if self.is_sparse() {
@@ -375,7 +396,6 @@ where
             // Merge registers from both sketches.
             let registers = self.registers.as_mut().unwrap();
             let other_registers_iter = other.registers_iter().unwrap();
-
             for (i, val) in other_registers_iter.enumerate() {
                 registers.set_greater(i, val);
             }
@@ -392,50 +412,25 @@ where
         if self.precision != other.precision() {
             return Err(HyperLogLogError::IncompatiblePrecision);
         }
-
         if other.is_sparse() {
             if self.is_sparse() {
                 // Self -> Sparse, Other -> Sparse
-                // Both sketches are in sparse representation.
-                //
                 // Insert all the hash codes of other into `tmpset`.
-
-                assert!(self.insert_tmpset.is_empty());
-                assert!(self.del_tmpset.is_empty());
-
-                for (hash_code, cnt) in
-                    zip(other.sparse.into_iter(), other.sparse_counters.into_iter())
-                {
-                    let tmpset_cnt = self.insert_tmpset.entry(hash_code).or_insert(0);
-                    *tmpset_cnt += cnt;
+                for hash_code in other.sparse.into_iter() {
+                    // Update the counter in tmpset by 1
+                    self.insert_tmpset.entry(hash_code).or_insert(1);
                 }
-
                 // Merge temporary set into sparse representation.
-                // RHS is number of registers in sparse representation * 0.8 = 2^14 * 0.8  = 13k
-                // So roughly every 130 inserts we flush.
                 if self.insert_tmpset.len() * 100 > self.counts.2 {
-                    self.merge_sparse()?;
+                    self.merge_inserts_sparse()?;
                 }
             } else {
                 // Self -> Dense, Other -> Sparse
-
-                // The other sketch is in sparse representation but not self.
-                //
-                // Decode all the hash codes and update the self's
-                // corresponding Registers.
-
                 let registers = self.registers.as_mut().unwrap();
-
-                // Handle the temporary insert and delete sets
-
                 assert!(self.del_tmpset.is_empty());
 
-                // Handle the main sparse representation
-
-                // We ignore the counts, because they wont affect the final result.
                 for hash_code in other.sparse.into_iter() {
                     let (zeros, index) = other.decode_hash(hash_code);
-
                     registers.set_greater(index, zeros);
                 }
             }
@@ -449,7 +444,6 @@ where
                 //
                 // Turn sparse into normal.
                 self.merge_sparse()?;
-
                 if self.is_sparse() {
                     self.sparse_to_normal();
                 }
@@ -458,12 +452,10 @@ where
             // Merge registers from both sketches.
             let registers = self.registers.as_mut().unwrap();
             let other_registers_iter = other.registers_iter().unwrap();
-
             for (i, val) in other_registers_iter.enumerate() {
                 registers.set_greater(i, val);
             }
         }
-
         Ok(())
     }
 
@@ -495,11 +487,11 @@ where
 
                 // Insert into register_counters
 
-                // Check if index exists in register_counters else create a new RunEncodedVarInt
+                // Check if index exists in register_counters else create a new ZeroCountMap
                 let counter_map = self
                     .register_counters
                     .entry(index as u16)
-                    .or_insert(RunEncodedVarInt::new());
+                    .or_insert(ZeroCountMap::new());
 
                 counter_map.increase_count_at_index(zeros as u8, 1);
             }
@@ -517,7 +509,8 @@ where
 
                 // Merge temporary set into sparse representation.
                 if self.insert_tmpset.len() * 100 > self.counts.2 {
-                    self.merge_sparse()?;
+                    self.merge_inserts_sparse()?;
+                    self.convert_to_dense_if_required();
                 }
             }
         }
@@ -563,9 +556,12 @@ where
 
                 let counter_map = self.register_counters.get_mut(&(index as u16)).unwrap();
                 // The register count is 0, so we update the max register or delete the register.
-                if  counter_map.decrease_count_at_index(zeros as u8, 1)? {
+                if counter_map.decrease_count_at_index(zeros as u8, 1)? {
                     let new_max_zeros = counter_map.arg_max();
                     registers.set_register(index, new_max_zeros as u32);
+                    if new_max_zeros == 0 {
+                        self.register_counters.remove(&(index as u16));
+                    }
                 }
             }
             None => {
@@ -582,7 +578,7 @@ where
 
                 // Merge temporary set into sparse representation.
                 if self.del_tmpset.len() * 100 > self.counts.2 {
-                    self.merge_del_sparse()?
+                    self.merge_deletes_sparse()?
                 }
             }
         }
@@ -601,11 +597,7 @@ where
             .and_then(|registers| Some(registers.iter()))
     }
 
-    #[inline] // Returns true if the HyperLogLog is using the
-              // sparse representation.
-    fn is_sparse(&self) -> bool {
-        self.registers.is_none()
-    }
+
 
     #[inline] // Encodes the hash value as a u32 integer.
     fn encode_hash(&self, mut hash: u64) -> u32 {
@@ -667,29 +659,45 @@ where
             let counter_map = self
                 .register_counters
                 .entry(index as u16)
-                .or_insert(RunEncodedVarInt::new());
+                .or_insert(ZeroCountMap::new());
             counter_map.increase_count_at_index(zeros as u8, cnt);
         }
 
         self.registers = Some(registers);
-
         self.insert_tmpset.clear();
         self.del_tmpset.clear();
-
         self.sparse.clear();
+    }
+
+    fn merge_sparse(&mut self) -> Result<(), HyperLogLogError> {
+        if !self.insert_tmpset.is_empty() {
+            self.merge_inserts_sparse()?;
+        }
+
+        if !self.del_tmpset.is_empty() {
+            self.merge_deletes_sparse()?;
+        }
+
+        self.convert_to_dense_if_required();
+
+        Ok(())
+    }
+
+    fn convert_to_dense_if_required(&mut self) {
+        if self.sparse.len() > self.counts.2 {
+            self.sparse_to_normal();
+        }
     }
 
     // Merges the hash codes stored in the temporary set to the sparse
     // representation.
-    fn merge_sparse(&mut self) -> Result<(), HyperLogLogError> {
+    fn merge_inserts_sparse(&mut self) -> Result<(), HyperLogLogError> {
         if self.insert_tmpset.is_empty() {
             return Ok(());
         }
 
         let mut set_codes: Vec<(u32, u32)> = self.insert_tmpset.clone().into_iter().collect();
-
         set_codes.sort();
-
 
         let mut buf = DifIntVec::with_capacity(self.sparse.len());
         let mut sparse_counts = VarIntVec::with_capacity(self.sparse.len());
@@ -707,7 +715,12 @@ where
             if set_hash_option.is_none() {
                 // Exists only in the sparse representation.
                 buf.push(buf_hash_option.unwrap());
-                let cnt = cnt_option.map_or(Err(HyperLogLogError::InvalidSparseInsert("Sparse insert is empty".to_string())), |cnt| Ok(cnt))?;
+                let cnt = cnt_option.map_or(
+                    Err(HyperLogLogError::InvalidSparseInsert(
+                        "Sparse insert is empty".to_string(),
+                    )),
+                    |cnt| Ok(cnt),
+                )?;
                 sparse_counts.push(cnt);
                 buf_hash_option = buf_iter.next();
                 cnt_option = cnt_iter.next();
@@ -719,9 +732,7 @@ where
                 // Exists only in the temporary set.
                 buf.push(*set_hash_code);
                 sparse_counts.push(*set_cnt);
-
                 set_hash_option = set_iter.next();
-
                 continue;
             }
 
@@ -731,39 +742,42 @@ where
             if set_hash_code == buf_hash_code {
                 // Exists in both the sparse representation and the temporary set.
                 buf.push(set_hash_code);
-                let cnt = cnt_option.map_or(Err(HyperLogLogError::InvalidSparseInsert("Counter during sparse insert is empty".to_string())), |cnt| Ok(cnt))?;
+                let cnt = cnt_option.map_or(
+                    Err(HyperLogLogError::InvalidSparseInsert(
+                        "Counter during sparse insert is empty".to_string(),
+                    )),
+                    |cnt| Ok(cnt),
+                )?;
                 sparse_counts.push(set_cnt + cnt);
-
                 set_hash_option = set_iter.next();
                 buf_hash_option = buf_iter.next();
                 cnt_option = cnt_iter.next();
             } else if set_hash_code > buf_hash_code {
                 buf.push(buf_hash_code);
-                let cnt = cnt_option.map_or(Err(HyperLogLogError::InvalidSparseInsert("Counter during sparse insert is empty".to_string())), |cnt| Ok(cnt))?;
+                let cnt = cnt_option.map_or(
+                    Err(HyperLogLogError::InvalidSparseInsert(
+                        "Counter during sparse insert is empty".to_string(),
+                    )),
+                    |cnt| Ok(cnt),
+                )?;
                 sparse_counts.push(cnt);
-
                 buf_hash_option = buf_iter.next();
                 cnt_option = cnt_iter.next();
             } else {
                 buf.push(set_hash_code);
                 sparse_counts.push(set_cnt);
-
                 set_hash_option = set_iter.next();
             }
         }
 
         self.sparse = buf;
         self.sparse_counters = sparse_counts;
-
         self.insert_tmpset.clear();
 
-        if self.sparse.len() > self.counts.2 {
-            self.sparse_to_normal();
-        }
         Ok(())
     }
 
-    fn merge_del_sparse(&mut self) -> Result<(), HyperLogLogError> {
+    fn merge_deletes_sparse(&mut self) -> Result<(), HyperLogLogError> {
         if self.del_tmpset.is_empty() {
             return Ok(());
         }
@@ -804,11 +818,20 @@ where
 
             if set_hash_code == buf_hash_code {
                 // Exists in both the sparse representation and the temporary set.
+                let cnt = cnt_option.map_or(
+                    Err(HyperLogLogError::InvalidSparseDelete(
+                        set_cnt,
+                        0,
+                        "Counter is empty".to_string(),
+                    )),
+                    |cnt| Ok(cnt),
+                )?;
 
-                if set_cnt > cnt_option.unwrap() {
+                if set_cnt > cnt {
                     return Err(HyperLogLogError::InvalidSparseDelete(
                         set_cnt,
-                        cnt_option.unwrap(),
+                        cnt,
+                        "Delete count is greater than set count".to_string(),
                     ));
                 } else if set_cnt < cnt_option.unwrap() {
                     buf.push(set_hash_code);
@@ -896,16 +919,15 @@ where
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use rand::prelude::IteratorRandom;
     use rand::Rng;
     use std::collections::HashSet;
     use std::hash::Hasher;
-
+    use rand::prelude::SliceRandom;
     struct PassThroughHasher(u64);
 
     impl Hasher for PassThroughHasher {
@@ -939,6 +961,9 @@ mod tests {
     }
 
     fn approx_equal(a: f64, b: f64, epsilon: f64) -> bool {
+        if a == 0.0 {
+            return b.abs() < epsilon;
+        }
         (a - b).abs() / a < epsilon
     }
 
@@ -959,9 +984,7 @@ mod tests {
     fn test_merge_self_sparse_other_dense_equal() {
         let (mut hll1, mut hll2) = setup_identical_hlls(50000);
 
-        println!("Sparse memory usage: {}", hll2.mem_size());
         hll2.sparse_to_normal();
-        println!("Dense memory usage: {}", hll2.mem_size());
 
         assert!(hll1.is_sparse());
         assert!(!hll2.is_sparse());
@@ -1031,9 +1054,6 @@ mod tests {
         set1.extend(&set2);
         let post_merge_exact_count = set1.len();
 
-        println!("post_merge_estimate: {}", post_merge_estimate);
-        println!("post_merge_exact_count: {}", post_merge_exact_count);
-
         assert!(approx_equal(
             post_merge_estimate,
             post_merge_exact_count as f64,
@@ -1054,9 +1074,6 @@ mod tests {
         let post_merge_estimate = hll1.count().unwrap();
         set1.extend(&set2);
         let post_merge_exact_count = set1.len();
-
-        println!("post_merge_estimate: {}", post_merge_estimate);
-        println!("post_merge_exact_count: {}", post_merge_exact_count);
 
         assert!(approx_equal(
             post_merge_estimate,
@@ -1080,9 +1097,6 @@ mod tests {
         set1.extend(&set2);
         let post_merge_exact_count = set1.len();
 
-        println!("post_merge_estimate: {}", post_merge_estimate);
-        println!("post_merge_exact_count: {}", post_merge_exact_count);
-
         assert!(approx_equal(
             post_merge_estimate,
             post_merge_exact_count as f64,
@@ -1103,9 +1117,6 @@ mod tests {
         let post_merge_estimate = hll1.count().unwrap();
         set1.extend(&set2);
         let post_merge_exact_count = set1.len();
-
-        println!("post_merge_estimate: {}", post_merge_estimate);
-        println!("post_merge_exact_count: {}", post_merge_exact_count);
 
         assert!(approx_equal(
             post_merge_estimate,
@@ -1129,13 +1140,28 @@ mod tests {
         let num_elements = elements.len() / 2;
         let error = (estimate as f64 - num_elements as f64).abs() / num_elements as f64;
 
-        println!("Estimated cardinality = {}", estimate);
-        println!("Actual cardinality = {}", elements.len() / 2);
-        println!("Relative error = {:.2}%", error * 100.0);
-
-        // HyperLogLogPlus has a probabilistic error rate.
-        // The following assert checks if the relative error is within expected bounds (e.g., 2% for p=14).
         assert!(error <= 0.02, "Relative error is more than 2%");
+    }
+
+    #[test]
+    fn test_insert_delete_simple() {
+        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+
+        let elements = vec![1, 3, 7];
+
+        for element in elements.iter() {
+            hll.insert(element).unwrap();
+        }
+
+        assert_eq!(hll.count().unwrap().round() as u64, elements.len() as u64);
+
+        hll.delete(&7).unwrap();
+        hll.delete(&1).unwrap();
+        hll.insert(&9).unwrap();
+        hll.insert(&10).unwrap();
+        hll.insert(&11).unwrap();
+
+        assert_eq!(hll.count().unwrap().round() as i64, 4);
     }
 
     #[test]
@@ -1150,7 +1176,7 @@ mod tests {
             hll.insert(&val).unwrap();
         }
         let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
         assert_eq!(count as usize, actual_count);
 
         for i in 0..2000 {
@@ -1163,7 +1189,7 @@ mod tests {
         assert!(hll.is_sparse());
 
         let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
         assert_eq!(count as usize, actual_count);
 
         for val in test_set.clone().into_iter() {
@@ -1183,7 +1209,7 @@ mod tests {
 
         assert!(hll.is_sparse());
         let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
         assert_eq!(count as usize, actual_count);
 
         let mut iter = test_set.clone().into_iter();
@@ -1197,19 +1223,19 @@ mod tests {
         let test_set = test_set.into_iter().skip(2500).collect::<Vec<u32>>();
 
         let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
         assert_eq!(count as usize, actual_count);
 
         for val in iter {
             hll.delete_any(&val).unwrap();
         }
 
-        assert_eq!(hll.count().unwrap(),  0.0);
+        assert_eq!(hll.count().unwrap(), 0.0);
     }
 
     #[test]
     fn test_insert_delete_dense() {
-        let mut hll = HyperLogLogPlus::<u32>::new(16).unwrap();
+        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
         let mut rng = rand::thread_rng();
         let mut test_set: Vec<u32> = vec![];
 
@@ -1218,20 +1244,22 @@ mod tests {
             test_set.push(val);
             hll.insert(&val).unwrap();
         }
-        let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
-        assert!(approx_equal(count, actual_count as f64, 0.01));
 
-        for i in 0..10000 {
+        assert!(!hll.is_sparse());
+        let count = hll.count().unwrap();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        assert!(approx_equal(count, actual_count as f64, 0.02));
+
+        for i in 0..15000 {
             hll.delete_any(&test_set[i]).unwrap();
         }
-
-        // Delete first 10000 elements from test set
-        test_set = test_set.into_iter().skip(10000).collect::<Vec<u32>>();
-
+        let old_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        // Delete first 15000 elements from test set
+        test_set = test_set.into_iter().skip(15000).collect::<Vec<u32>>();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        assert!(old_count > actual_count);
         let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
-        assert!(approx_equal(count, actual_count as f64, 0.01));
+        assert!(approx_equal(count, actual_count as f64, 0.02));
 
         for val in test_set.clone().into_iter() {
             hll.delete_any(&val).unwrap();
@@ -1241,37 +1269,37 @@ mod tests {
         assert_eq!(count as usize, 0);
 
         test_set.clear();
+        assert_eq!(hll.register_counters.len(), 0);
 
-        for _ in 0..20000 {
-            let val: u32 = rng.gen_range(0, 500);
+        for _ in 0..30000 {
+            let val: u32 = rng.gen_range(0, 10000);
             test_set.push(val);
             hll.insert(&val).unwrap();
         }
+
+        assert!(!hll.is_sparse());
         let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
         assert!(approx_equal(count, actual_count as f64, 0.01));
 
-        let mut iter = test_set.clone().into_iter();
-
-        for _ in 0..10000 {
-            if let Some(val) = iter.next() {
-                hll.delete_any(&val).unwrap();
-            }
+        for i in 0..20000 {
+            hll.delete_any(&test_set[i]).unwrap();
         }
 
-        let test_set = test_set.into_iter().skip(10000).collect::<Vec<u32>>();
+        let old_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        let test_set = test_set.into_iter().skip(20000).collect::<Vec<u32>>();
+        let actual_count = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
+        assert!(actual_count < old_count);
 
         let count = hll.count().unwrap();
-        let actual_count  = test_set.clone().into_iter().collect::<HashSet<u32>>().len();
-        assert_eq!(count as usize, actual_count);
+        assert!(approx_equal(count, actual_count as f64, 0.02));
 
-        for val in iter {
+        for val in test_set.clone().into_iter() {
             hll.delete_any(&val).unwrap();
         }
 
-        assert_eq!(hll.count().unwrap(),  0.0);
+        assert_eq!(hll.count().unwrap(), 0.0);
     }
-
 
     #[test]
     fn test_insert_any_with_random_inputs() {
@@ -1300,16 +1328,9 @@ mod tests {
         let estimate = hll.count().unwrap();
         let error = (estimate as f64 - actual_cardinality as f64).abs() / actual_cardinality as f64;
 
-        println!("Estimated cardinality = {}", estimate);
-        println!("Actual cardinality = {}", actual_cardinality);
-        println!("Relative error = {:.2}%", error * 100.0);
-
-        // HyperLogLogPlus has a probabilistic error rate.
-        // The following assert checks if the relative error is within expected bounds (e.g., 2% for p=14).
         assert!(error <= 0.02, "Relative error is more than 2%");
         assert_eq!(hll.is_sparse(), true);
     }
-
 
     #[test]
     fn test_sparse_encode_hash() {
@@ -1392,7 +1413,6 @@ mod tests {
         assert_eq!(hll.insert_tmpset.len(), 0);
     }
 
-
     #[test]
     fn test_sparse_trigger_sparse_to_normal() {
         let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(4).unwrap();
@@ -1419,7 +1439,7 @@ mod tests {
         let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
         let mut rng = rand::thread_rng();
 
-        // Generate 10000 random elements in the range 1-500
+        // Generate 10000 random elements in the range 1-5000
         let mut elements: Vec<u32> = Vec::with_capacity(1000000);
         for _ in 0..10000 {
             let x = rng.gen_range(1, 5000);
@@ -1436,12 +1456,6 @@ mod tests {
         let num_elements = elements.clone().into_iter().collect::<HashSet<u32>>().len();
         let error = (estimate as f64 - num_elements as f64).abs() / num_elements as f64;
 
-        println!("Estimated cardinality = {}", estimate);
-        println!("Actual cardinality = {}", num_elements);
-        println!("Relative error = {:.2}%", error * 100.0);
-
-        // HyperLogLogPlus has a probabilistic error rate.
-        // The following assert checks if the relative error is within expected bounds (e.g., 2% for p=14).
         assert!(error <= 0.01, "Relative error is more than 1%");
 
         hll.sparse_to_normal();
@@ -1463,8 +1477,6 @@ mod tests {
             let x = rng.gen_range(1, 1000);
             elements.push(x);
         }
-        let num_elements = elements.clone().into_iter().collect::<HashSet<u32>>().len();
-        println!("Actual cardinality = {}", num_elements);
 
         // Insert elements into the HyperLogLogPlus
         for element in &elements {
@@ -1479,11 +1491,7 @@ mod tests {
         }
 
         for &i in &delete_indices {
-            let d = hll.delete_any(&elements[i]);
-            if d.is_err() {
-                println!("Error deleting element {} at index {}, {}", &elements[i], i, d.err().unwrap());
-                assert!(false);
-            }
+            assert!(hll.delete_any(&elements[i]).is_ok());
         }
 
         // Remove the deleted elements from `elements`
@@ -1501,10 +1509,6 @@ mod tests {
         let estimate = hll.count().unwrap();
         let error = (estimate as f64 - num_elements as f64).abs() / num_elements as f64;
 
-        println!("Estimated cardinality = {}", estimate);
-        println!("Post deletion Actual cardinality = {}", num_elements);
-        println!("Relative error = {:.2}%", error * 100.0);
-
         // HyperLogLogPlus has a probabilistic error rate.
         // The following assert checks if the relative error is within expected bounds (e.g., 2% for p=14).
         assert!(error <= 0.02, "Relative error is more than 2%");
@@ -1515,8 +1519,6 @@ mod tests {
         assert!(!hll.is_sparse());
         let estimate = hll.count().unwrap();
         let error = (estimate as f64 - num_elements as f64).abs() / num_elements as f64;
-        println!("Estimated cardinality = {}", estimate);
-        println!("Relative error = {:.2}%", error * 100.0);
         assert!(error <= 0.02, "Relative error is more than 2%");
     }
 
@@ -1572,19 +1574,25 @@ mod tests {
         let hash_codes: Vec<u32> = hll.sparse.into_iter().collect();
 
         let sip_hasher = HyperLogLogPlus::<u64>::default_hasher();
-        let post_hash_codes: Vec<u64> = hashes.iter().map(|hash| {
-            let mut hasher = sip_hasher.clone();
-            hash.hash(&mut hasher);
-            hasher.finish()
-        }).collect();
+        let post_hash_codes: Vec<u64> = hashes
+            .iter()
+            .map(|hash| {
+                let mut hasher = sip_hasher.clone();
+                hash.hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect();
 
-        let expected_hash_codes: Vec<u32> =
-            post_hash_codes.iter().map(|hash| hll.encode_hash(*hash)).collect();
+        let expected_hash_codes: Vec<u32> = post_hash_codes
+            .iter()
+            .map(|hash| hll.encode_hash(*hash))
+            .collect();
         assert_eq!(hll.count().unwrap() as u64, 5);
         // Do not check the order of the hash codes.
-        assert_eq!(hash_codes.into_iter().collect::<HashSet<u32>>(),
-                   expected_hash_codes.into_iter().collect::<HashSet<u32>>());
-
+        assert_eq!(
+            hash_codes.into_iter().collect::<HashSet<u32>>(),
+            expected_hash_codes.into_iter().collect::<HashSet<u32>>()
+        );
     }
 
     #[test]
@@ -1805,10 +1813,9 @@ mod tests {
         assert!(!hll.is_sparse() && !other.is_sparse());
     }
 
-
     #[test]
     fn test_serialization_deserialization_sparse() {
-        let mut hll1 =HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll1 = HyperLogLogPlus::<u32>::new(14).unwrap();
 
         let mut rng = rand::thread_rng();
 
@@ -1828,8 +1835,7 @@ mod tests {
         let bytes = hll1.to_bytes().unwrap();
 
         // Deserialize
-        let mut hll2: HyperLogLogPlus::<i32> =
-            HyperLogLogPlus::from_bytes_compact(&bytes).unwrap();
+        let mut hll2: HyperLogLogPlus<i32> = HyperLogLogPlus::from_bytes_compact(&bytes).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll2.count().unwrap());
@@ -1838,24 +1844,25 @@ mod tests {
 
         assert!(hll2.count().is_err());
 
-
         // Deserialize
-        let mut hll3: HyperLogLogPlus::<i32> =
-            HyperLogLogPlus::from_bytes(&bytes).unwrap();
+        let mut hll3: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize(&bytes).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll3.count().unwrap());
         let cur_cnt = hll1.count().unwrap();
 
         hll3.insert(&501).unwrap();
-        assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )).abs() < 0.0001);
+        assert!((hll3.count().unwrap() - (cur_cnt + 1.0)).abs() < 0.0001);
         hll3.insert(&501).unwrap();
-        assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )).abs() < 0.0001);
+        assert!((hll3.count().unwrap() - (cur_cnt + 1.0)).abs() < 0.0001);
 
         hll3.delete_any(&501).unwrap();
-        assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )).abs() < 0.0001);
+        assert!((hll3.count().unwrap() - (cur_cnt + 1.0)).abs() < 0.0001);
         hll3.delete_any(&501).unwrap();
         assert!((hll3.count().unwrap() - cur_cnt).abs() < 0.0001);
+
+        let mut hll4: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize_compact(&bytes).unwrap();
+        assert_eq!(hll1.count().unwrap(), hll4.count().unwrap());
     }
 
     #[test]
@@ -1879,11 +1886,10 @@ mod tests {
         }
 
         // Serialize
-        let bytes = hll1.to_bytes().unwrap();
+        let bytes = hll1.serialize().unwrap();
 
         // Deserialize
-        let mut hll2: HyperLogLogPlus::<i32> =
-            HyperLogLogPlus::from_bytes_compact(&bytes).unwrap();
+        let mut hll2: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize_compact(&bytes).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll2.count().unwrap());
@@ -1891,22 +1897,184 @@ mod tests {
         let cur_cnt = hll1.count().unwrap();
 
         // Deserialize
-        let mut hll3: HyperLogLogPlus::<i32> =
-            HyperLogLogPlus::from_bytes(&bytes).unwrap();
+        let mut hll3: HyperLogLogPlus<i32> = HyperLogLogPlus::<i32>::deserialize(&bytes).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll3.count().unwrap());
 
         hll3.insert(&50011).unwrap();
-        println!("{} {}", hll3.count().unwrap(), cur_cnt);
-        assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )) < 0.1);
+        assert!((hll3.count().unwrap() - (cur_cnt + 1.0)) < 0.1);
         hll3.insert(&50011).unwrap();
-        assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )) < 0.1);
+        assert!((hll3.count().unwrap() - (cur_cnt + 1.0)) < 0.1);
 
         hll3.delete_any(&50011).unwrap();
-        assert!((hll3.count().unwrap() -  (cur_cnt + 1.0 )).abs() < 0.1);
+        assert!((hll3.count().unwrap() - (cur_cnt + 1.0)).abs() < 0.1);
         hll3.delete_any(&50011).unwrap();
         assert!((hll3.count().unwrap() - cur_cnt).abs() < 0.1);
+
+        let mut hll4: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize_compact(&bytes).unwrap();
+        assert_eq!(hll1.count().unwrap(), hll4.count().unwrap());
+    }
+
+    #[test]
+    fn test_merge_multiple_hyperloglogs() {
+        let num_hlls = 50;
+        let mut hlls = Vec::with_capacity(num_hlls);
+        let mut set: HashMap<u32, u32> = HashMap::new();
+        let mut cnt_sparse_hlls = 0;
+        let mut cnt_dense_hlls = 0;
+        let mut hll_vals = Vec::with_capacity(num_hlls);
+        let mut rng = rand::thread_rng();
+        for _i in 0..num_hlls {
+            let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+            let num_points = rand::thread_rng().gen_range(1, 30000);
+            let mut tmp_set: HashMap<u32, u32> = HashMap::new();
+            for _j in 0..num_points {
+                let x = rng.gen_range(1, 100000);
+                hll.insert(&x).unwrap();
+                // Increment count in set by 1
+                let count = set.entry(x).or_insert(0);
+                *count += 1;
+                let count = tmp_set.entry(x).or_insert(0);
+                *count += 1;
+            }
+            hll_vals.push(tmp_set);
+
+            match hll.is_sparse() {
+                true => cnt_sparse_hlls += 1,
+                false => cnt_dense_hlls += 1,
+            }
+            hlls.push(hll);
+        }
+        assert!(cnt_sparse_hlls > 0);
+        assert!(cnt_dense_hlls > 0);
+        assert_eq!(hll_vals.len(), num_hlls);
+
+        let mut serialized_hlls = vec![];
+        // Merge all the HyperLogLogs
+        let mut merged_hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        for mut hll in hlls.into_iter() {
+            merged_hll.merge(&hll).unwrap();
+            serialized_hlls.push(hll.serialize().unwrap());
+        }
+
+        // Verify the merged HyperLogLog has the correct count
+        assert!(approx_equal(
+            merged_hll.count().unwrap(),
+            set.len() as f64,
+            0.02
+        ));
+
+        // Deserialize and merge .
+        let mut merged_hll2 = HyperLogLogPlus::<u32>::new(14).unwrap();
+        for serialized_hll in serialized_hlls.iter() {
+            let hll = HyperLogLogPlus::<u32>::deserialize(serialized_hll).unwrap();
+            merged_hll2.merge(&hll).unwrap();
+        }
+
+        assert!(approx_equal(
+            merged_hll2.count().unwrap(),
+            set.len() as f64,
+            0.02
+        ));
+
+        // Compact deserialize and merge.
+        let mut merged_hll3 = HyperLogLogPlus::<u32>::new(14).unwrap();
+        for serialized_hll in serialized_hlls.iter() {
+            let hll = HyperLogLogPlus::<u32>::deserialize_compact(serialized_hll).unwrap();
+            merged_hll3.merge_compact(&hll).unwrap();
+        }
+
+        assert!(approx_equal(
+            merged_hll3.count().unwrap(),
+            set.len() as f64,
+            0.02
+        ));
+
+        // Delete some elements from the merged HyperLogLog
+        let insert_count = set.len();
+        let mut merged_hll_post_del = HyperLogLogPlus::<u32>::new(14).unwrap();
+        for i in 0..num_hlls {
+            // Pick a random subset from hlls_vals[i] to delete.
+            let mut keys: Vec<_> = hll_vals[i].keys().collect::<Vec<_>>();
+            keys.shuffle(&mut rng);
+            let mut hll = HyperLogLogPlus::<u32>::deserialize(&serialized_hlls[i]).unwrap();
+            assert!(approx_equal(hll.count().unwrap(), hll_vals[i].len() as f64, 0.03));
+            let num_to_delete = rng.gen_range(1, keys.len());
+            for j in 0..num_to_delete {
+                // Delete from set too
+                let count = set.get_mut(&keys[j]).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    set.remove(&keys[j]);
+                }
+                hll.delete(&keys[j]).unwrap();
+            }
+            merged_hll_post_del.merge_compact(&hll).unwrap();
+        }
+
+        assert!(set.len() < insert_count);
+        assert!(approx_equal(
+            merged_hll_post_del.count().unwrap(),
+            set.len() as f64,
+            0.02
+        ));
+    }
+
+    #[test]
+    fn test_delete_post_deserialization() {
+        let mode = vec![false, true];
+        for keep_sparse in mode {
+            let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+            let mut counter = HashMap::new();
+            for _j in 0..500 {
+                let x = rand::thread_rng().gen_range(1, 100);
+                hll.insert(&x).unwrap();
+                // Increment counter of x in counter
+                let count = counter.entry(x).or_insert(0);
+                *count += 1;
+            }
+
+            let bytes = hll.serialize().unwrap();
+
+            let mut hll2 = HyperLogLogPlus::<u32>::deserialize(&bytes).unwrap();
+            // Verify the merged HyperLogLog has the correct count
+            assert!(approx_equal(
+                hll2.count().unwrap(),
+                counter.len() as f64,
+                0.02
+            ));
+
+            if !keep_sparse {
+                hll2.merge_sparse().unwrap();
+                hll2.sparse_to_normal();
+            }
+
+            // Delete elements from counter and HyperLogLog
+            while counter.len() > 0 {
+                // Pick a random element in counter
+                let key = counter
+                    .keys()
+                    .choose(&mut rand::thread_rng())
+                    .unwrap()
+                    .clone();
+                let val = counter.get(&key).unwrap();
+                // Delete from counter
+                hll.delete_any(&key).unwrap();
+                if val == &1 {
+                    counter.remove(&key);
+                } else {
+                    let count = counter.entry(key).or_insert(0);
+                    *count -= 1;
+                }
+                // Check counts
+                assert!(approx_equal(
+                    hll.count().unwrap(),
+                    counter.len() as f64,
+                    0.03
+                ));
+            }
+        }
     }
 
     #[cfg(feature = "bench-units")]

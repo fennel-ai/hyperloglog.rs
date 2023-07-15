@@ -31,10 +31,10 @@ mod hyperloglogplus;
 #[cfg(not(feature = "std"))]
 mod log;
 
+use bytes::Bytes;
 use core::borrow::Borrow;
 use core::fmt;
 use core::hash::Hash;
-use bytes::Bytes;
 
 // Available only with std.
 #[cfg(feature = "std")]
@@ -61,16 +61,20 @@ pub trait HyperLogLog<H: Hash + ?Sized> {
     fn merge(&mut self, other: &Self) -> Result<(), HyperLogLogError>;
 
     /// Merges another HyperLogLogPlus into this one without using any counter data.
-    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) ->  Result<(), HyperLogLogError>;
+    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) -> Result<(), HyperLogLogError>;
 
     /// Serializes the HyperLogLogPlus into a byte array.
     fn serialize(&mut self) -> Result<Bytes, HyperLogLogError>;
 
     /// Deserializes a byte array into a HyperLogLogPlus.
-    fn deserialize(bytes: &[u8]) -> Result<Self, HyperLogLogError> where Self: Sized;
+    fn deserialize(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    where
+        Self: Sized;
 
     /// Deserializes a byte array into a HyperLogLogPlus without loading any counter data.
-    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError> where Self: Sized;
+    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    where
+        Self: Sized;
 
     /// Returns the estimate of the memory used by the multiset.
     fn mem_size(&mut self) -> usize;
@@ -80,7 +84,7 @@ pub trait HyperLogLog<H: Hash + ?Sized> {
 pub enum HyperLogLogError {
     InvalidPrecision,
     IncompatiblePrecision,
-    InvalidSparseDelete(u32, u32),
+    InvalidSparseDelete(u32, u32, String),
     InvalidSparseInsert(String),
     InvalidDenseDelete(u32, u32),
     EmptyBuffer,
@@ -97,11 +101,11 @@ impl fmt::Display for HyperLogLogError {
             HyperLogLogError::InvalidSparseInsert(msg) => {
                 write!(f, "invalid insert in sparse format: {}", msg)
             }
-            HyperLogLogError::InvalidSparseDelete(index, size) => {
+            HyperLogLogError::InvalidSparseDelete(index, size, msg) => {
                 write!(
                     f,
-                    "invalid index to delete in sparse format: {}, current length: {}",
-                    index, size
+                    "invalid index to delete in sparse format: {}, current length: {}: msg: {}",
+                    index, size, msg
                 )
             }
             HyperLogLogError::InvalidDenseDelete(index, size) => {

@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use crate::common::RegistersPlus;
-use crate::encoding::{DifIntVec, RunEncodedVarInt, VarIntVec};
+use crate::encoding::{DifIntVec, ZeroCountMap, VarIntVec};
 use crate::{HyperLogLogError, HyperLogLogPlus};
 use serde::{Deserialize, Serialize};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -37,7 +37,6 @@ impl<H> HyperLogLogPlus<H>
     pub fn to_bytes(&mut self) -> Result<Bytes, HyperLogLogError> {
         if self.is_sparse() {
             self.merge_sparse()?;
-            self.merge_del_sparse()?;
         }
         let serializable = HyperLogLogPlusSerializable {
             precision: self.precision,
@@ -58,10 +57,7 @@ impl<H> HyperLogLogPlus<H>
         w.write_all(&non_counter_data).map_err(|e| HyperLogLogError::SerializationError(e.to_string()))?;
         w.write_u8(self.is_sparse() as u8).map_err(|e| HyperLogLogError::SerializationError(e.to_string()))?;
         w.write_all(&counter_data).map_err(|e| HyperLogLogError::SerializationError(e.to_string()))?;
-        let buf = w.into_inner();
-
-         let x = buf.freeze();
-        Ok(x)
+        Ok(w.into_inner().freeze())
     }
 
 
@@ -138,8 +134,8 @@ impl<H> HyperLogLogPlus<H>
         num_bytes_read += 1;
 
         let counter_bytes_len = bytes.len() - num_bytes_read;
-        let mut counter_bytes = vec![0; counter_bytes_len as usize];
-        r.read_to_end(&mut counter_bytes).map_err(|e| HyperLogLogError::DeserializationError(e.to_string()))?;
+        let mut counter_bytes: Vec<u8> = vec![0; counter_bytes_len as usize];
+        r.read_exact(&mut counter_bytes).map_err(|e| HyperLogLogError::DeserializationError(e.to_string()))?;
 
         if is_sparse as u8 == 1 {
             let sparse_counters = VarIntVec::from_bytes(counter_bytes)?;
@@ -165,7 +161,7 @@ impl<H> HyperLogLogPlus<H>
                 del_tmpset: HashMap::new(),
                 sparse,
                 registers,
-                sparse_counters: VarIntVec::new(), // Initialize an empty sparse_counters
+                sparse_counters: VarIntVec::new(),
                 register_counters,
                 phantom: PhantomData::<H>,
             })
@@ -189,30 +185,28 @@ const FOURTEEN_BIT_NON_NULL_MASK: u8 = 0b1100_0000;
 // Indicator mask for NULL registers counts that require 6 bits.
 const SIX_BIT_NOT_NULL_MASK : u8 = 0b1000_0000;
 
-// The following functions are used to serialize the dense counters which is a hashmap of u16 -> RunEncodedVarInt.
-// The hashmap is serialized as a vector of bytes, where there is an indicator byte followed by the bytes to represent the RunEncodedVarInt.
+// The following functions are used to serialize the dense counters which is a hashmap of u16 -> ZeroCountMap.
+// The hashmap is serialized as a vector of bytes, where there is an indicator byte followed by the bytes to represent the ZeroCountMap.
 // The indicator byte works as follows:
 // If the first bit is 0, then we are looking at a series of NULL registers counts.
 //      A. If the second bit is 0, then the next 6 bits represent the number of NULL registers counts.
 //      B. If the second bit is 1, then the next 14 ( 6 + 8 )  bits represent number of NULL registers counts.
 // If the first bit is 1, then we are looking at a non-NULL register count.
-//      A. As before, if the second bit is 0, then the next 6 bits represent the number of bytes taken by the RunEncodedVarInt.
-//      B. If the second bit is 1, then the next 14 ( 6 + 8 ) bits represent the number of bytes taken by the RunEncodedVarInt
-fn serialize_register_counters(register_counters: &HashMap<u16, RunEncodedVarInt>) -> Result<Bytes, HyperLogLogError> {
+//      A. As before, if the second bit is 0, then the next 6 bits represent the number of bytes taken by the ZeroCountMap.
+//      B. If the second bit is 1, then the next 14 ( 6 + 8 ) bits represent the number of bytes taken by the ZeroCountMap
+fn serialize_register_counters(register_counters: &HashMap<u16, ZeroCountMap>) -> Result<Bytes, HyperLogLogError> {
     // The buffer is initialized with minimum capacity of threes byte ( one for indicator and two for value) per register.
     let mut buffer = Vec::with_capacity(register_counters.len() * 3);
-    let mut null_count: u16 = 0;
-    let mut last_key: u16 = 0;
+    let mut null_count: i32 = 0;
+    let mut last_key: i32 = -1;
 
     // Sort the keys so that we can keep track of null registers.
     let mut keys: Vec<&u16> = register_counters.keys().collect();
     keys.sort();
 
     for key in keys {
-        let run_encoded = register_counters.get(key).unwrap();
-
         // Find the number of null registers till the current key.
-        while *key > (last_key + null_count) + 1 {
+        while *key as i32 > (last_key + null_count) + 1 {
             null_count += 1;
         }
 
@@ -227,12 +221,12 @@ fn serialize_register_counters(register_counters: &HashMap<u16, RunEncodedVarInt
             null_count = 0;
         }
 
-        let bytes = run_encoded.to_bytes();
+        let run_encoded = register_counters.get(key).unwrap();
+        let bytes = run_encoded.serialize();
         let byte_len = bytes.len() as u16;
 
         // Write the indicator byte and length.
         if byte_len < 64 {
-
             // Length fits within 6 bits.
             buffer.push(SIX_BIT_NOT_NULL_MASK | (byte_len as u8));
         } else {
@@ -242,16 +236,16 @@ fn serialize_register_counters(register_counters: &HashMap<u16, RunEncodedVarInt
             buffer.push((byte_len & 0xFF) as u8);
         }
 
-        // Write the bytes of the RunEncodedVarInt.
+        // Write the bytes of the ZeroCountMap.
         buffer.extend_from_slice(&bytes);
-        last_key = *key;
+        last_key = *key as i32;
     }
 
     Ok(Bytes::from(buffer))
 }
 
-fn deserialize_register_counters(bytes: Bytes) -> Result<HashMap<u16, RunEncodedVarInt>, HyperLogLogError> {
-    let mut index: u16 = 1;
+fn deserialize_register_counters(bytes: Bytes) -> Result<HashMap<u16, ZeroCountMap>, HyperLogLogError> {
+    let mut index: u16 = 0;
     let mut register_counters = HashMap::new();
     let r = std::io::Cursor::new(bytes);
     let mut r = r.reader();
@@ -279,11 +273,11 @@ fn deserialize_register_counters(bytes: Bytes) -> Result<HashMap<u16, RunEncoded
                 ((indicator_byte as usize & SIX_BIT_INFO_MASK as usize) << 8) | (next_byte as usize)
             };
             let mut buffer: Vec<u8> = vec![0; byte_len];
-            // Get the bytes of the RunEncodedVarInt.
+            // Get the bytes of the ZeroCountMap.
             r.read_exact(&mut buffer).map_err(|e| HyperLogLogError::DeserializationError(e.to_string()))?;
-            // Add the RunEncodedVarInt to the HashMap.
+            // Add the ZeroCountMap to the HashMap.
 
-            register_counters.insert(index, RunEncodedVarInt::from_bytes(buffer.to_vec())?);
+            register_counters.insert(index, ZeroCountMap::deserialize(buffer.to_vec())?);
             index += 1;
         }
     }
@@ -295,60 +289,66 @@ fn deserialize_register_counters(bytes: Bytes) -> Result<HashMap<u16, RunEncoded
 mod tests {
     use super::*;
     use rand::Rng;
+    use rand::prelude::SliceRandom;
 
-    fn generate_runencodedvarint() -> RunEncodedVarInt {
-        let mut v = RunEncodedVarInt::new();
+    fn generate_zero_count_map() -> ZeroCountMap {
+        let mut v = ZeroCountMap::new();
         let mut rng = rand::thread_rng();
+        let mut index_val = HashMap::new();
         for _i in 0..30 {
             let num = rng.gen_range(1, 63);
             let val = rng.gen_range(0, 10000000);
             v.increase_count_at_index(num, val);
+            let count = index_val.entry(num).or_insert(0);
+            *count += val;
+        }
+        // Pick a random subset of keys and decrease the count by a random amount.
+        let mut keys: Vec<u8> = index_val.keys().map(|x| *x).collect();
+        keys.shuffle(&mut rng);
+        for i in 0..rng.gen_range(1, keys.len()) {
+            let key = keys[i];
+            let val = rng.gen_range(0, index_val[&key]);
+            v.decrease_count_at_index(key, val).unwrap();
+            let count = index_val.entry(key).or_insert(0);
+            *count -= val;
         }
         v
     }
 
-    fn setup() -> HashMap<u16, RunEncodedVarInt> {
+    fn setup() -> HashMap<u16, ZeroCountMap> {
         let mut register_counters = HashMap::new();
         let mut rng = rand::thread_rng();
 
-        let num_registers = rng.gen_range(1, 1600);
-        for _i in 0..num_registers {
-            let index = rng.gen_range(1, 1600);
-            let v = generate_runencodedvarint();
-            register_counters.insert(index, v);
+        let num_registers = rng.gen_range(1, 16000);
+        let mut set = std::collections::HashSet::new();
+        for i in 0..num_registers {
+            // Skip random registers.
+            if rng.gen_range(0, 100) < 60 {
+                continue;
+            }
+            set.insert(i);
+            register_counters.insert(i, generate_zero_count_map());
         }
         register_counters
     }
 
-    fn compare_maps(map1: &HashMap<u16, RunEncodedVarInt>, map2: &HashMap<u16, RunEncodedVarInt>) -> bool {
-        if map1.len() != map2.len() {
-            return false;
-        }
-
+    fn compare_maps(map1: &HashMap<u16, ZeroCountMap>, map2: &HashMap<u16, ZeroCountMap>) {
+        assert_eq!(map1.len(), map2.len());
         for (key, val) in map1 {
             match map2.get(key) {
-                Some(other_val) => {
-                    if *val != *other_val {
-                        return false;
-                    }
-                }
-                None => {
-                    return false;
-                },
+                Some(other_val) => assert_eq!(val, other_val),
+                None => assert!(false),
             }
         }
-
-        true
     }
 
     #[test]
     fn test_serialize_deserialize_register_counters() {
         let register_counters = setup();
-
         let serialized = serialize_register_counters(&register_counters).unwrap();
         let deserialized = deserialize_register_counters(serialized).unwrap();
 
-        assert!(compare_maps(&register_counters, &deserialized));
+        compare_maps(&register_counters, &deserialized);
     }
 
 }
