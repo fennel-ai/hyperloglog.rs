@@ -35,13 +35,14 @@ use bytes::Bytes;
 use core::borrow::Borrow;
 use core::fmt;
 use core::hash::Hash;
+use std::hash::BuildHasher;
 
 // Available only with std.
 #[cfg(feature = "std")]
 pub use crate::hyperloglogplus::HyperLogLogPlus;
 
 /// A trait that should be implemented by any HyperLogLog variant.
-pub trait HyperLogLog<H: Hash + ?Sized> {
+pub trait HyperLogLog<H: Hash + ?Sized, B: BuildHasher> {
     /// Inserts a new value to the multiset.
     fn insert<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError>
     where
@@ -60,19 +61,18 @@ pub trait HyperLogLog<H: Hash + ?Sized> {
     /// Merges the multiset with another multiset.
     fn merge(&mut self, other: &Self) -> Result<(), HyperLogLogError>;
 
-    /// Merges another HyperLogLogPlus into this one without using any counter data.
-    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) -> Result<(), HyperLogLogError>;
+    fn merge_compact(&mut self, other: &HyperLogLogPlus<H, B>)  -> Result<(), HyperLogLogError>;
 
     /// Serializes the HyperLogLogPlus into a byte array.
     fn serialize(&mut self) -> Result<Bytes, HyperLogLogError>;
 
     /// Deserializes a byte array into a HyperLogLogPlus.
-    fn deserialize(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    fn deserialize(bytes: &[u8], builder: B) -> Result<Self, HyperLogLogError>
     where
         Self: Sized;
 
     /// Deserializes a byte array into a HyperLogLogPlus without loading any counter data.
-    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    fn deserialize_compact(bytes: &[u8], builder: B) -> Result<Self, HyperLogLogError>
     where
         Self: Sized;
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use crate::common::RegistersPlus;
@@ -16,6 +16,7 @@ const CODEC_VERSION: u8 = 0x01;
 struct HyperLogLogPlusSerializable<H>
     where
         H: Hash + ?Sized,
+
 {
     precision: u8,
     counts:    (usize, usize, usize),
@@ -24,9 +25,10 @@ struct HyperLogLogPlusSerializable<H>
     phantom:   PhantomData<H>,
 }
 
-impl<H> HyperLogLogPlus<H>
+impl<H, B> HyperLogLogPlus<H, B>
     where
         H: Hash + ?Sized,
+        B: BuildHasher
 {
     // Serialization format:
     // 1. CODEC_VERSION: u8
@@ -62,7 +64,7 @@ impl<H> HyperLogLogPlus<H>
 
 
     // This function only reads the non-counter data and is meant to be used during read operations to prevent large allocations.
-    pub fn from_bytes_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError> {
+    pub fn from_bytes_compact(bytes: &[u8], builder: B) -> Result<Self, HyperLogLogError> {
         if bytes.is_empty() {
             return Err(HyperLogLogError::EmptyBuffer);
         }
@@ -87,7 +89,7 @@ impl<H> HyperLogLogPlus<H>
         } = bincode::deserialize(&bytes).map_err(|e| HyperLogLogError::DeserializationError(e.to_string()))?;
 
         Ok(HyperLogLogPlus {
-            builder: Self::default_hasher(),
+            builder,
             precision,
             counts,
             insert_tmpset: HashMap::new(),
@@ -101,7 +103,7 @@ impl<H> HyperLogLogPlus<H>
     }
 
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HyperLogLogError> {
+    pub fn from_bytes(bytes: &[u8], builder: B) -> Result<Self, HyperLogLogError> {
         if bytes.is_empty() {
             return Err(HyperLogLogError::EmptyBuffer);
         }
@@ -140,7 +142,7 @@ impl<H> HyperLogLogPlus<H>
         if is_sparse as u8 == 1 {
             let sparse_counters = VarIntVec::from_bytes(counter_bytes)?;
             Ok(HyperLogLogPlus {
-                builder: Self::default_hasher(),
+                builder,
                 precision,
                 counts,
                 insert_tmpset: HashMap::new(),
@@ -154,7 +156,7 @@ impl<H> HyperLogLogPlus<H>
         } else {
             let register_counters = deserialize_register_counters(Bytes::from(counter_bytes))?;
             Ok(HyperLogLogPlus {
-                builder: Self::default_hasher(),
+                builder,
                 precision,
                 counts,
                 insert_tmpset: HashMap::new(),

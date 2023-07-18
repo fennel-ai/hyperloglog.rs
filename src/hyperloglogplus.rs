@@ -2,7 +2,7 @@ use bytes::Bytes;
 use core::fmt::Debug;
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::zip;
 use std::marker::PhantomData;
 
@@ -11,10 +11,8 @@ use crate::constants;
 use crate::encoding::{DifIntVec, ZeroCountMap, VarIntVec};
 use crate::HyperLogLog;
 use crate::HyperLogLogError;
-use siphasher::sip::SipHasher13;
 
-const SEEDED_HASH1: u64 = 0x9b8d7e6f;
-const SEEDED_HASH2: u64 = 0xdeadbeef;
+
 
 mod same_module {
     include!("serde.rs");
@@ -41,7 +39,7 @@ mod same_module {
 /// use std::collections::hash_map::RandomState;
 /// use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 ///
-/// let mut hllp: HyperLogLogPlus<u32> = HyperLogLogPlus::new(16).unwrap();
+/// let mut hllp: HyperLogLogPlus<u32, _> = HyperLogLogPlus::new(16, RandomState::new()).unwrap();
 ///
 /// hllp.insert(&12345);
 /// hllp.insert(&23456);
@@ -62,12 +60,13 @@ mod same_module {
 ///   Nunkesser and Alexander Hall.](https://goo.gl/iU8Ig)
 ///
 #[derive(Clone, Debug)]
-pub struct HyperLogLogPlus<H>
+pub struct HyperLogLogPlus<H, B>
 where
     H: Hash + ?Sized,
+    B: BuildHasher,
 {
     precision: u8,
-    builder: SipHasher13,
+    builder: B,
     counts: (usize, usize, usize),
 
     // Data structures for sparse representation.
@@ -85,11 +84,14 @@ where
     phantom: PhantomData<H>,
 }
 
-impl<H> HyperLogLogCommon for HyperLogLogPlus<H> where H: Hash + ?Sized {}
+impl<H, B> HyperLogLogCommon for HyperLogLogPlus<H, B>
+    where H: Hash + ?Sized,
+          B: BuildHasher, {}
 
-impl<H> HyperLogLog<H> for HyperLogLogPlus<H>
+impl<H, B> HyperLogLog<H, B> for HyperLogLogPlus<H, B>
 where
     H: Hash + ?Sized,
+    B: BuildHasher,
 {
     /// Inserts a new value to the multiset.
     fn insert<Q>(&mut self, value: &Q) -> Result<(), HyperLogLogError>
@@ -115,12 +117,12 @@ where
     }
 
     /// Merges another HyperLogLogPlus into this one.
-    fn merge(&mut self, other: &HyperLogLogPlus<H>) -> Result<(), HyperLogLogError> {
+    fn merge(&mut self, other: &HyperLogLogPlus<H, B>) -> Result<(), HyperLogLogError> {
         self.merge_impl(other)
     }
 
     /// Merges another HyperLogLogPlus into this one without using any counter data.
-    fn merge_compact(&mut self, other: &HyperLogLogPlus<H>) -> Result<(), HyperLogLogError> {
+    fn merge_compact(&mut self, other: &HyperLogLogPlus<H, B>) -> Result<(), HyperLogLogError> {
         self.compact_merge_impl(other)
     }
 
@@ -130,19 +132,19 @@ where
     }
 
     /// Deserializes a byte array into a HyperLogLogPlus.
-    fn deserialize(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    fn deserialize(bytes: &[u8], builder: B) -> Result<Self, HyperLogLogError>
     where
         Self: Sized,
     {
-        HyperLogLogPlus::from_bytes(bytes)
+        HyperLogLogPlus::from_bytes(bytes, builder)
     }
 
     /// Deserializes a byte array into a HyperLogLogPlus without loading any counter data.
-    fn deserialize_compact(bytes: &[u8]) -> Result<Self, HyperLogLogError>
+    fn deserialize_compact(bytes: &[u8], builder: B) -> Result<Self, HyperLogLogError>
     where
         Self: Sized,
     {
-        HyperLogLogPlus::from_bytes_compact(bytes)
+        HyperLogLogPlus::from_bytes_compact(bytes, builder)
     }
 
     /// Returns the estimate of the memory used by the multiset.
@@ -151,9 +153,10 @@ where
     }
 }
 
-impl<H> HyperLogLogPlus<H>
+impl<H, B> HyperLogLogPlus<H, B>
 where
     H: Hash + ?Sized,
+    B: BuildHasher,
 {
     // Minimum precision allowed.
     const MIN_PRECISION: u8 = 4;
@@ -163,7 +166,7 @@ where
     const PRIME_PRECISION: u8 = 25;
 
     /// Creates a new HyperLogLogPlus instance.
-    pub fn new(precision: u8) -> Result<Self, HyperLogLogError> {
+    pub fn new(precision: u8, builder: B) -> Result<Self, HyperLogLogError> {
         // Ensure the specified precision is within bounds.
         if precision < Self::MIN_PRECISION || precision > Self::MAX_PRECISION {
             return Err(HyperLogLogError::InvalidPrecision);
@@ -178,7 +181,7 @@ where
 
         Ok(HyperLogLogPlus {
             precision,
-            builder: Self::default_hasher(),
+            builder,
             counts,
             insert_tmpset: HashMap::new(),
             del_tmpset: HashMap::new(),
@@ -188,10 +191,6 @@ where
             sparse_counters: VarIntVec::new(),
             phantom: PhantomData,
         })
-    }
-
-    fn default_hasher() -> SipHasher13 {
-        SipHasher13::new_with_keys(SEEDED_HASH1, SEEDED_HASH2)
     }
 
     /// Size of the HyperLogLogPlus instance in bytes.
@@ -286,9 +285,10 @@ where
     /// Both sketches must have the same precision. Merge can trigger
     /// the transition from sparse to normal representation.
     ///
-    fn merge_impl<S>(&mut self, other: &HyperLogLogPlus<S>) -> Result<(), HyperLogLogError>
+    fn merge_impl<S, T>(&mut self, other: &HyperLogLogPlus<S, T>) -> Result<(), HyperLogLogError>
     where
         S: Hash + ?Sized,
+        T: BuildHasher,
     {
         if self.precision != other.precision() {
             return Err(HyperLogLogError::IncompatiblePrecision);
@@ -405,9 +405,10 @@ where
     }
 
     /// Compact merge is similar to merge but does not use counters.
-    fn compact_merge_impl<S>(&mut self, other: &HyperLogLogPlus<S>) -> Result<(), HyperLogLogError>
+    fn compact_merge_impl<S, T>(&mut self, other: &HyperLogLogPlus<S, T>) -> Result<(), HyperLogLogError>
     where
         S: Hash + ?Sized,
+        T: BuildHasher,
     {
         if self.precision != other.precision() {
             return Err(HyperLogLogError::IncompatiblePrecision);
@@ -464,10 +465,11 @@ where
     where
         R: Hash + ?Sized,
     {
-        // Calculate the hash.
-        let sip = &mut self.builder.clone();
-        value.hash(sip);
-        let mut hash: u64 = sip.finish();
+        // Create a new hasher.
+        let mut hasher = self.builder.build_hasher();
+        value.hash(&mut hasher);
+        // Use a 64-bit hash value.
+        let mut hash: u64 = hasher.finish();
 
         match &mut self.registers {
             Some(registers) => {
@@ -530,10 +532,10 @@ where
         R: Hash + ?Sized,
     {
         // Create a new hasher.
-        let sip = &mut self.builder.clone();
-        value.hash(sip);
+        let mut hasher = self.builder.build_hasher();
+        value.hash(&mut hasher);
         // Use a 64-bit hash value.
-        let mut hash: u64 = sip.finish();
+        let mut hash: u64 = hasher.finish();
 
         match &mut self.registers {
             Some(registers) => {
@@ -928,6 +930,11 @@ mod tests {
     use std::collections::HashSet;
     use std::hash::Hasher;
     use rand::prelude::SliceRandom;
+    use siphasher::sip::SipHasher13;
+
+    const SEEDED_HASH1: u64 = 0x9b8d7e6f;
+    const SEEDED_HASH2: u64 = 0xdeadbeef;
+
     struct PassThroughHasher(u64);
 
     impl Hasher for PassThroughHasher {
@@ -945,9 +952,20 @@ mod tests {
         }
     }
 
-    fn setup_identical_hlls(num_elements: usize) -> (HyperLogLogPlus<u32>, HyperLogLogPlus<u32>) {
-        let mut hll1 = HyperLogLogPlus::<u32>::new(14).unwrap();
-        let mut hll2 = HyperLogLogPlus::<u32>::new(14).unwrap();
+    struct SipHasher;
+
+    impl BuildHasher for SipHasher {
+        type Hasher = siphasher::sip::SipHasher13;
+
+        #[inline]
+        fn build_hasher(&self) -> Self::Hasher {
+            SipHasher13::new_with_keys(SEEDED_HASH1, SEEDED_HASH2)
+        }
+    }
+
+    fn setup_identical_hlls(num_elements: usize) -> (HyperLogLogPlus<u32,SipHasher>, HyperLogLogPlus<u32, SipHasher>) {
+        let mut hll1 = HyperLogLogPlus::<u32,SipHasher>::new(14, SipHasher{}).unwrap();
+        let mut hll2 = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         let mut rng = rand::thread_rng();
 
         // Generate random elements in the range 1-500
@@ -1014,14 +1032,14 @@ mod tests {
         num_elements: usize,
     ) -> (
         HashSet<u32>,
-        HyperLogLogPlus<u32>,
+        HyperLogLogPlus<u32, SipHasher>,
         HashSet<u32>,
-        HyperLogLogPlus<u32>,
+        HyperLogLogPlus<u32, SipHasher>,
     ) {
         let mut set1 = HashSet::new();
-        let mut hll1 = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll1 = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         let mut set2 = HashSet::new();
-        let mut hll2 = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll2 = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         let mut rng = rand::thread_rng();
 
         // Generate random elements in the range 1-50000 for hll1
@@ -1127,7 +1145,7 @@ mod tests {
 
     #[test]
     fn test_insert_any() {
-        let mut hll = HyperLogLogPlus::<i32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<i32, SipHasher>::new(14, SipHasher{}).unwrap();
         let elements: Vec<i32> = (1..=1000).chain(1..=1000).collect();
 
         // Insert elements into the HyperLogLogPlus
@@ -1145,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_insert_delete_simple() {
-        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
 
         let elements = vec![1, 3, 7];
 
@@ -1166,7 +1184,7 @@ mod tests {
 
     #[test]
     fn test_insert_delete_sparse() {
-        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         let mut rng = rand::thread_rng();
         let mut test_set: Vec<u32> = vec![];
 
@@ -1235,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_insert_delete_dense() {
-        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         let mut rng = rand::thread_rng();
         let mut test_set: Vec<u32> = vec![];
 
@@ -1304,7 +1322,7 @@ mod tests {
     #[test]
     fn test_insert_any_with_random_inputs() {
         let mut rng = rand::thread_rng(); // Create a random number generator
-        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
 
         // Generate 1000 random elements in the range 1-500
         let mut elements: Vec<u32> = Vec::with_capacity(100000);
@@ -1334,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_sparse_encode_hash() {
-        let hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(14).unwrap();
+        let hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(14, SipHasher{}).unwrap();
 
         //                 < ... 14 ... > .. 25 .. >
         let index: u64 = 0b0000000000111000000000000;
@@ -1357,7 +1375,7 @@ mod tests {
 
     #[test]
     fn test_sparse_decode_hash() {
-        let hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(8).unwrap();
+        let hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(8, SipHasher{}).unwrap();
 
         let (zeros, index) = hll.decode_hash(hll.encode_hash(0xffffff8000000000));
 
@@ -1382,7 +1400,7 @@ mod tests {
 
     #[test]
     fn test_sparse_merge_sparse() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         let hashes: [u64; 3] = [0xf000017000000000, 0x000fff8f00000000, 0x0f00017000000000];
 
@@ -1415,7 +1433,7 @@ mod tests {
 
     #[test]
     fn test_sparse_trigger_sparse_to_normal() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(4).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(4, SipHasher{}).unwrap();
 
         for i in 1..4 {
             hll.insert(&(1 << i)).unwrap();
@@ -1436,7 +1454,7 @@ mod tests {
 
     #[test]
     fn test_sparse_to_normal_complex() {
-        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         let mut rng = rand::thread_rng();
 
         // Generate 10000 random elements in the range 1-5000
@@ -1469,7 +1487,7 @@ mod tests {
 
     #[test]
     fn test_sparse_to_normal_complex_with_deletes() {
-        let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         let mut rng = rand::thread_rng();
         // Generate 10000 random elements in the range 1-5000
         let mut elements: Vec<u32> = Vec::with_capacity(10000);
@@ -1524,7 +1542,7 @@ mod tests {
 
     #[test]
     fn test_sparse_to_normal_simple() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         hll.insert(&1).unwrap();
 
@@ -1538,7 +1556,7 @@ mod tests {
 
         assert!(hll.registers.is_some());
 
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         hll.insert(&2).unwrap();
         hll.insert(&3).unwrap();
@@ -1553,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_sparse_count() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         let hashes: [u64; 6] = [
             0x00010fffffffffff,
@@ -1573,7 +1591,7 @@ mod tests {
 
         let hash_codes: Vec<u32> = hll.sparse.into_iter().collect();
 
-        let sip_hasher = HyperLogLogPlus::<u64>::default_hasher();
+        let sip_hasher = SipHasher13::new_with_keys(SEEDED_HASH1, SEEDED_HASH2);
         let post_hash_codes: Vec<u64> = hashes
             .iter()
             .map(|hash| {
@@ -1597,7 +1615,7 @@ mod tests {
 
     #[test]
     fn test_estimate_bias() {
-        let hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(4).unwrap();
+        let hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(4, SipHasher{}).unwrap();
 
         let bias = hll.estimate_bias(14.0988);
 
@@ -1611,7 +1629,7 @@ mod tests {
 
         assert!((bias - (-1.7606)).abs() < 1e-5);
 
-        let hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         let bias = hll.estimate_bias(55391.4373);
 
@@ -1620,7 +1638,7 @@ mod tests {
 
     #[test]
     fn test_estimate_bias_count() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(4).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(4, SipHasher{}).unwrap();
 
         hll.sparse_to_normal();
 
@@ -1633,8 +1651,8 @@ mod tests {
 
     #[test]
     fn test_merge_error() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
-        let other: HyperLogLogPlus<u64> = HyperLogLogPlus::new(12).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
+        let other: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(12, SipHasher{}).unwrap();
 
         assert_eq!(
             hll.merge(&other),
@@ -1644,8 +1662,8 @@ mod tests {
 
     #[test]
     fn test_merge_both_sparse() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
-        let mut other: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
+        let mut other: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         other.insert(&0x00010ffffffffff).unwrap();
         other.insert(&0x00020ffffffffff).unwrap();
@@ -1691,8 +1709,8 @@ mod tests {
 
     #[test]
     fn test_merge_both_normal() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
-        let mut other: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
+        let mut other: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         hll.sparse_to_normal();
         other.sparse_to_normal();
@@ -1741,8 +1759,8 @@ mod tests {
 
     #[test]
     fn test_merge_sparse_to_normal() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
-        let mut other: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
+        let mut other: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         hll.sparse_to_normal();
 
@@ -1790,8 +1808,8 @@ mod tests {
 
     #[test]
     fn test_merge_normal_to_sparse() {
-        let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
-        let mut other: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+        let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
+        let mut other: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
         other.sparse_to_normal();
 
@@ -1815,7 +1833,7 @@ mod tests {
 
     #[test]
     fn test_serialization_deserialization_sparse() {
-        let mut hll1 = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut hll1 = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
 
         let mut rng = rand::thread_rng();
 
@@ -1835,7 +1853,7 @@ mod tests {
         let bytes = hll1.to_bytes().unwrap();
 
         // Deserialize
-        let mut hll2: HyperLogLogPlus<i32> = HyperLogLogPlus::from_bytes_compact(&bytes).unwrap();
+        let mut hll2: HyperLogLogPlus<i32, SipHasher> = HyperLogLogPlus::from_bytes_compact(&bytes, SipHasher{}).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll2.count().unwrap());
@@ -1845,7 +1863,7 @@ mod tests {
         assert!(hll2.count().is_err());
 
         // Deserialize
-        let mut hll3: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize(&bytes).unwrap();
+        let mut hll3: HyperLogLogPlus<i32, SipHasher> = HyperLogLogPlus::deserialize(&bytes, SipHasher{}).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll3.count().unwrap());
@@ -1861,13 +1879,13 @@ mod tests {
         hll3.delete_any(&501).unwrap();
         assert!((hll3.count().unwrap() - cur_cnt).abs() < 0.0001);
 
-        let mut hll4: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize_compact(&bytes).unwrap();
+        let mut hll4: HyperLogLogPlus<i32, SipHasher> = HyperLogLogPlus::deserialize_compact(&bytes, SipHasher{}).unwrap();
         assert_eq!(hll1.count().unwrap(), hll4.count().unwrap());
     }
 
     #[test]
     fn test_serialization_deserialization_dense() {
-        let mut hll1 = HyperLogLogPlus::<i32>::new(14).unwrap();
+        let mut hll1 = HyperLogLogPlus::<i32, SipHasher>::new(14, SipHasher{}).unwrap();
 
         let mut rng = rand::thread_rng();
 
@@ -1889,7 +1907,7 @@ mod tests {
         let bytes = hll1.serialize().unwrap();
 
         // Deserialize
-        let mut hll2: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize_compact(&bytes).unwrap();
+        let mut hll2: HyperLogLogPlus<i32, SipHasher> = HyperLogLogPlus::deserialize_compact(&bytes, SipHasher{}).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll2.count().unwrap());
@@ -1897,7 +1915,7 @@ mod tests {
         let cur_cnt = hll1.count().unwrap();
 
         // Deserialize
-        let mut hll3: HyperLogLogPlus<i32> = HyperLogLogPlus::<i32>::deserialize(&bytes).unwrap();
+        let mut hll3: HyperLogLogPlus<i32, SipHasher> = HyperLogLogPlus::<i32, SipHasher>::deserialize(&bytes, SipHasher{}).unwrap();
 
         // Verify counts are the same
         assert_eq!(hll1.count().unwrap(), hll3.count().unwrap());
@@ -1912,7 +1930,7 @@ mod tests {
         hll3.delete_any(&50011).unwrap();
         assert!((hll3.count().unwrap() - cur_cnt).abs() < 0.1);
 
-        let mut hll4: HyperLogLogPlus<i32> = HyperLogLogPlus::deserialize_compact(&bytes).unwrap();
+        let mut hll4: HyperLogLogPlus<i32, SipHasher> = HyperLogLogPlus::deserialize_compact(&bytes, SipHasher{}).unwrap();
         assert_eq!(hll1.count().unwrap(), hll4.count().unwrap());
     }
 
@@ -1926,7 +1944,7 @@ mod tests {
         let mut hll_vals = Vec::with_capacity(num_hlls);
         let mut rng = rand::thread_rng();
         for _i in 0..num_hlls {
-            let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+            let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
             let num_points = rand::thread_rng().gen_range(1, 30000);
             let mut tmp_set: HashMap<u32, u32> = HashMap::new();
             for _j in 0..num_points {
@@ -1952,7 +1970,7 @@ mod tests {
 
         let mut serialized_hlls = vec![];
         // Merge all the HyperLogLogs
-        let mut merged_hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut merged_hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         for mut hll in hlls.into_iter() {
             merged_hll.merge(&hll).unwrap();
             serialized_hlls.push(hll.serialize().unwrap());
@@ -1966,9 +1984,9 @@ mod tests {
         ));
 
         // Deserialize and merge .
-        let mut merged_hll2 = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut merged_hll2 = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         for serialized_hll in serialized_hlls.iter() {
-            let hll = HyperLogLogPlus::<u32>::deserialize(serialized_hll).unwrap();
+            let hll = HyperLogLogPlus::<u32, SipHasher>::deserialize(serialized_hll, SipHasher{}).unwrap();
             merged_hll2.merge(&hll).unwrap();
         }
 
@@ -1979,9 +1997,9 @@ mod tests {
         ));
 
         // Compact deserialize and merge.
-        let mut merged_hll3 = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut merged_hll3 = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         for serialized_hll in serialized_hlls.iter() {
-            let hll = HyperLogLogPlus::<u32>::deserialize_compact(serialized_hll).unwrap();
+            let hll = HyperLogLogPlus::<u32, SipHasher>::deserialize_compact(serialized_hll, SipHasher{}).unwrap();
             merged_hll3.merge_compact(&hll).unwrap();
         }
 
@@ -1993,12 +2011,12 @@ mod tests {
 
         // Delete some elements from the merged HyperLogLog
         let insert_count = set.len();
-        let mut merged_hll_post_del = HyperLogLogPlus::<u32>::new(14).unwrap();
+        let mut merged_hll_post_del = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
         for i in 0..num_hlls {
             // Pick a random subset from hlls_vals[i] to delete.
             let mut keys: Vec<_> = hll_vals[i].keys().collect::<Vec<_>>();
             keys.shuffle(&mut rng);
-            let mut hll = HyperLogLogPlus::<u32>::deserialize(&serialized_hlls[i]).unwrap();
+            let mut hll = HyperLogLogPlus::<u32, SipHasher>::deserialize(&serialized_hlls[i], SipHasher{}).unwrap();
             assert!(approx_equal(hll.count().unwrap(), hll_vals[i].len() as f64, 0.03));
             let num_to_delete = rng.gen_range(1, keys.len());
             for j in 0..num_to_delete {
@@ -2025,7 +2043,7 @@ mod tests {
     fn test_delete_post_deserialization() {
         let mode = vec![false, true];
         for keep_sparse in mode {
-            let mut hll = HyperLogLogPlus::<u32>::new(14).unwrap();
+            let mut hll = HyperLogLogPlus::<u32, SipHasher>::new(14, SipHasher{}).unwrap();
             let mut counter = HashMap::new();
             for _j in 0..500 {
                 let x = rand::thread_rng().gen_range(1, 100);
@@ -2037,7 +2055,7 @@ mod tests {
 
             let bytes = hll.serialize().unwrap();
 
-            let mut hll2 = HyperLogLogPlus::<u32>::deserialize(&bytes).unwrap();
+            let mut hll2 = HyperLogLogPlus::<u32, SipHasher>::deserialize(&bytes, SipHasher{}).unwrap();
             // Verify the merged HyperLogLog has the correct count
             assert!(approx_equal(
                 hll2.count().unwrap(),
@@ -2089,7 +2107,7 @@ mod tests {
         fn bench_plus_insert_normal(b: &mut Bencher) {
             let builder = PassThroughHasherBuilder {};
 
-            let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+            let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
             hll.sparse_to_normal();
 
@@ -2128,7 +2146,7 @@ mod tests {
         fn bench_plus_count_normal(b: &mut Bencher) {
             let builder = PassThroughHasherBuilder {};
 
-            let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+            let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
             hll.sparse_to_normal();
 
@@ -2142,7 +2160,7 @@ mod tests {
         fn bench_plus_merge_sparse(b: &mut Bencher) {
             let builder = PassThroughHasherBuilder {};
 
-            let mut hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(16).unwrap();
+            let mut hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(16, SipHasher{}).unwrap();
 
             for i in 0u64..500 {
                 hll.insert(&(i << 39));
@@ -2164,7 +2182,7 @@ mod tests {
 
         #[bench]
         fn bench_estimate_bias(b: &mut Bencher) {
-            let hll: HyperLogLogPlus<u64> = HyperLogLogPlus::new(18).unwrap();
+            let hll: HyperLogLogPlus<u64, SipHasher> = HyperLogLogPlus::new(18).unwrap();
 
             b.iter(|| {
                 let bias = hll.estimate_bias(275468.768);
