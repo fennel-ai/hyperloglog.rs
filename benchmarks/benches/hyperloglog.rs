@@ -62,7 +62,7 @@ fn bench_count(c: &mut Criterion) {
 
             c.bench_function($testname, |b| {
                 b.iter(|| {
-                    let val = hll.count();
+                    let val = hll.count().unwrap();
                     black_box(val);
                 })
             });

@@ -100,7 +100,7 @@ macro_rules! run_impls {
 
                                 Estimation(
                                     (i + 1) as u64,
-                                    hll.count().trunc() as u64,
+                                    hll.count().unwrap().trunc() as u64,
                                 )
                             })
                             .collect();
@@ -147,7 +147,7 @@ macro_rules! run_impls {
                                     c += 1;
                                 }
 
-                                Estimation(c as u64, hll.count().trunc() as u64)
+                                Estimation(c as u64, hll.count().unwrap().trunc() as u64)
                             })
                             .collect();
 
