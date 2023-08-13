@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::zip;
 use std::marker::PhantomData;
+use std::path::Path;
+use std::time::Instant;
 
 use crate::common::*;
 use crate::constants;
-use crate::encoding::{DifIntVec, ZeroCountMap, VarIntVec};
+use crate::encoding::{DifIntVec, ZeroCountMap, VarIntVec, DifIntVecIntoIter, VarIntVecIntoIter};
 use crate::HyperLogLog;
 use crate::HyperLogLogError;
 
@@ -779,28 +781,22 @@ where
         Ok(())
     }
 
-    fn merge_deletes_sparse(&mut self) -> Result<(), HyperLogLogError> {
-        if self.del_tmpset.is_empty() {
-            return Ok(());
-        }
 
+    fn get_sorted_del_codes(&self) -> Vec<(u32, u32)> {
         let mut set_codes: Vec<(u32, u32)> = self.del_tmpset.clone().into_iter().collect();
-
         set_codes.sort();
+        set_codes
+    }
 
+
+    fn pair_wise_iterate_del_sparse(&self, set_codes:  Vec<(u32, u32)> , mut buf_iter: DifIntVecIntoIter, mut cnt_iter: VarIntVecIntoIter) -> Result<(DifIntVec, VarIntVec), HyperLogLogError> {
+        let mut set_iter = set_codes.iter();
         let mut buf = DifIntVec::with_capacity(self.sparse.len());
         let mut sparse_counts = VarIntVec::with_capacity(self.sparse.len());
-
-        let (mut set_iter, mut buf_iter, mut cnt_iter) = (
-            set_codes.iter(),
-            self.sparse.into_iter(),
-            self.sparse_counters.into_iter(),
-        );
-
         let (mut set_hash_option, mut buf_hash_option, mut cnt_option) =
             (set_iter.next(), buf_iter.next(), cnt_iter.next());
-
         while set_hash_option.is_some() || buf_hash_option.is_some() {
+            let now = Instant::now();
             if set_hash_option.is_none() {
                 // Exists only in the sparse representation.
                 buf.push(buf_hash_option.unwrap());
@@ -855,12 +851,39 @@ where
                 // Advance the set iterator.
                 set_hash_option = set_iter.next();
             }
+            log::error!("Pairwise iteration took {:?}", now.elapsed());
+        }
+        Ok((buf, sparse_counts))
+    }
+
+
+    fn merge_deletes_sparse(&mut self) -> Result<(), HyperLogLogError> {
+        if self.del_tmpset.is_empty() {
+            return Ok(());
         }
 
-        self.sparse = buf;
-        self.sparse_counters = sparse_counts;
+        log::error!("Merging deletes sparse");
+
+        let cur = Instant::now();
+
+        let set_codes: Vec<(u32, u32)> = self.get_sorted_del_codes();
+
+        log::error!("Sorted del codes in {:?}", cur.elapsed());
+
+        let ( buf_iter, cnt_iter) = (
+            self.sparse.into_iter(),
+            self.sparse_counters.into_iter(),
+        );
+
+
+        log::error!("Starting merge with Sparse: {} and  SetCodes: {}", self.sparse.len(), set_codes.len());
+        let (x, y) = self.pair_wise_iterate_del_sparse(set_codes, buf_iter, cnt_iter)?;
+
+        self.sparse = x;
+        self.sparse_counters = y;
 
         self.del_tmpset.clear();
+        log::error!("Merged deletes sparse in {:?}", cur.elapsed());
         Ok(())
     }
 
